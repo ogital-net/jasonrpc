@@ -94,12 +94,33 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> HttpResponse<ResponseBody
 /// router's method table is shared behind an `Arc`, so a clone only bumps that
 /// reference count and clones the state handle.
 ///
-/// ```
+/// A full accept loop against hyper 1.x looks like this — clone the service
+/// per connection and drive it with `serve_connection`:
+///
+/// ```no_run
+/// # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// use hyper::server::conn::http1;
+/// use hyper_util::rt::TokioIo;
+/// use tokio::net::TcpListener;
 /// use jasonrpc::server::Router;
 /// use jasonrpc::integration::hyper::HyperService;
 ///
-/// let _service = HyperService::new(Router::new());
+/// let router = Router::new(); // register your methods here
+/// let service = HyperService::new(router);
+///
+/// let listener = TcpListener::bind(("127.0.0.1", 8080)).await?;
+/// loop {
+///     let (stream, _) = listener.accept().await?;
+///     let service = service.clone(); // cheap: Arc bump + state clone
+///     tokio::spawn(async move {
+///         let io = TokioIo::new(stream);
+///         let _ = http1::Builder::new().serve_connection(io, service).await;
+///     });
+/// }
+/// # }
 /// ```
+///
+/// See the `hyper_demo` example for a complete client + server program.
 pub struct HyperService<S> {
     router: Router<S>,
 }

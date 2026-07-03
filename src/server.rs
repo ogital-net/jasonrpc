@@ -74,7 +74,27 @@ pub enum Output {
 }
 
 impl Output {
-    /// Serialize this output to wire bytes, or `None` if there is nothing to send.
+    /// Serialize this output to wire bytes.
+    ///
+    /// The two-layer return type distinguishes three outcomes:
+    ///
+    /// - `Ok(Some(bytes))` — a response to send.
+    /// - `Ok(None)` — nothing to send ([`Output::Empty`]: a notification or an
+    ///   all-notification batch). Send no bytes; for HTTP reply `204 No Content`.
+    /// - `Err(_)` — serialization failed (see below).
+    ///
+    /// ```
+    /// # fn main() -> Result<(), jasonrpc::protocol::Error> {
+    /// use jasonrpc::server::Output;
+    /// use jasonrpc::{Id, Response};
+    ///
+    /// let single = Output::Single(Response::result(Id::Number(1), 19_i64));
+    /// assert!(single.to_bytes()?.is_some());
+    ///
+    /// assert!(Output::Empty.to_bytes()?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -251,6 +271,26 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         }
     }
 
+    /// Borrow the router's shared state.
+    ///
+    /// Handy when the state handle (typically an `Arc<...>`) is needed outside
+    /// the router — for example to drive background work with the same shared
+    /// state the handlers see. Clone it if you need an owned copy.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use jasonrpc::server::Router;
+    ///
+    /// let router = Router::with_state(Arc::new(42_i64));
+    /// assert_eq!(**router.state(), 42);
+    /// let handle = Arc::clone(router.state());
+    /// # let _ = handle;
+    /// ```
+    #[must_use]
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
     /// Cap the number of entries accepted in a single batch request.
     ///
     /// Because batch elements are dispatched sequentially, an unbounded batch
@@ -274,6 +314,12 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     }
 
     /// Register a handler for `method`.
+    ///
+    /// A handler is any async closure `Fn(S, Request) -> impl
+    /// Future<Output = Result<T, Error>>` where `T: Serialize`. The state
+    /// argument's type usually can't be inferred from the closure alone, so
+    /// annotate it — `|state: MyState, req: Request| ...` — when the compiler
+    /// asks. The [`Request`] parameter's type annotation is likewise required.
     ///
     /// # Panics
     ///
@@ -703,5 +749,14 @@ mod tests {
         for h in handles {
             assert!(h.await.unwrap().contains("\"result\":7"));
         }
+    }
+
+    #[test]
+    fn state_accessor_returns_shared_handle() {
+        let router = Router::with_state(Arc::new(99_i64));
+        assert_eq!(**router.state(), 99);
+        // The accessor hands back the same Arc the handlers would clone.
+        let handle = Arc::clone(router.state());
+        assert_eq!(*handle, 99);
     }
 }

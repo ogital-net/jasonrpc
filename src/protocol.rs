@@ -475,6 +475,42 @@ impl Request {
             None => crate::json::from_slice::<T>(b"null").ok(),
         }
     }
+
+    /// Deserialize a single positional parameter.
+    ///
+    /// Convenience for the common single-argument method: it accepts either a
+    /// one-element positional array (`[value]`, the spec-conformant form a
+    /// client sends) or a bare `value`, and yields the inner `T`. This saves
+    /// defining a newtype or matching a one-element tuple for methods like
+    /// `device.get(id)`.
+    ///
+    /// Returns `None` if there are no params, if the array does not hold
+    /// exactly one element, or if the element fails to deserialize into `T`.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), jasonrpc::json::JsonError> {
+    /// use jasonrpc::{Request, Id};
+    ///
+    /// // `{"params": [7]}` — the usual positional form.
+    /// let req: Request =
+    ///     jasonrpc::json::from_slice(br#"{"jsonrpc":"2.0","method":"get","params":[7],"id":1}"#)?;
+    /// assert_eq!(req.param_as::<i64>(), Some(7));
+    ///
+    /// // A bare scalar `{"params": 7}` also works.
+    /// let req: Request =
+    ///     jasonrpc::json::from_slice(br#"{"jsonrpc":"2.0","method":"get","params":7,"id":1}"#)?;
+    /// assert_eq!(req.param_as::<i64>(), Some(7));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn param_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        // Prefer the spec form `[value]`; fall back to a bare `value`.
+        if let Some((value,)) = self.params_as::<(T,)>() {
+            return Some(value);
+        }
+        self.params_as::<T>()
+    }
 }
 
 /// A JSON-RPC 2.0 response object.
@@ -782,5 +818,52 @@ mod tests {
 
         let err = Error::new(-32000, "x").with_data(AlwaysFails);
         assert!(err.data_raw().is_none());
+    }
+
+    #[test]
+    fn param_as_single_positional() {
+        // `[value]` — the spec-conformant positional form.
+        let req: Request =
+            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":[7],"id":1}"#)
+                .unwrap();
+        assert_eq!(req.param_as::<i64>(), Some(7));
+
+        // Bare scalar also accepted.
+        let req: Request =
+            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":7,"id":1}"#)
+                .unwrap();
+        assert_eq!(req.param_as::<i64>(), Some(7));
+
+        // A single-element string array.
+        let req: Request =
+            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":["hi"],"id":1}"#)
+                .unwrap();
+        assert_eq!(req.param_as::<String>(), Some("hi".to_owned()));
+    }
+
+    #[test]
+    fn param_as_rejects_wrong_arity_and_missing() {
+        // Two elements: not a single param.
+        let req: Request =
+            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":[1,2],"id":1}"#)
+                .unwrap();
+        assert_eq!(req.param_as::<i64>(), None);
+
+        // Empty array.
+        let req: Request =
+            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":[],"id":1}"#)
+                .unwrap();
+        assert_eq!(req.param_as::<i64>(), None);
+
+        // No params at all.
+        let req: Request =
+            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","id":1}"#).unwrap();
+        assert_eq!(req.param_as::<i64>(), None);
+
+        // Wrong element type.
+        let req: Request =
+            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":["x"],"id":1}"#)
+                .unwrap();
+        assert_eq!(req.param_as::<i64>(), None);
     }
 }
