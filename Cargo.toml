@@ -1,0 +1,107 @@
+[package]
+name = "jasonrpc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Lightweight, transport-agnostic, spec-conforming JSON-RPC 2.0 for Rust"
+license = "BSD-2-Clause"
+repository = "https://github.com/ogital-net/jasonrpc"
+readme = "README.md"
+categories = ["network-programming", "encoding", "web-programming"]
+keywords = ["json-rpc", "jsonrpc", "rpc", "uds", "hyper"]
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "examples/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
+
+[features]
+default = ["backend-serde-json"]
+
+# --- JSON backends (select exactly one) ---
+backend-serde-json = ["dep:serde_json"]
+backend-sonic = ["dep:sonic-rs"]
+
+# --- Library layers ---
+server = []
+client = []
+transport = []
+
+# HTTP client transport
+http-client = [
+    "client",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:bytes",
+]
+
+# Individual framings (only meaningful with `transport`).
+netstring = ["transport", "dep:itoa"]
+newline = ["transport", "dep:memchr"]
+
+# Async I/O helpers for the transport layer.
+tokio = ["transport", "dep:tokio"]
+
+# --- Integrations ---
+hyper = ["server", "dep:hyper", "dep:http", "dep:http-body-util", "dep:bytes"]
+# `tower` pulls in only the tiny `tower-service` + `http` traits, so it drops
+# into an axum/tower stack without dragging in the whole `tower` crate.
+tower = ["server", "dep:tower-service", "dep:http", "dep:http-body", "dep:http-body-util", "dep:bytes"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+# JSON backends (optional, one selected via feature).
+serde_json = { version = "1", optional = true, features = ["raw_value"] }
+sonic-rs = { version = "0.5", optional = true }
+
+# Transport async I/O (optional). `sync`/`rt` back the multiplexing client
+# transport (oneshot correlation channels + a background reader task).
+tokio = { version = "1", optional = true, features = ["io-util", "net", "sync", "rt", "time"] }
+
+# Free transitive deps we use directly in framing codecs.
+itoa = { version = "1", optional = true }
+memchr = { version = "2", optional = true }
+
+# Hyper integration (optional). `client`/`http1` are needed by the HTTP client
+# transport; the server integration only needs `server`/`http1`.
+hyper = { version = "1", optional = true, features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+
+# Tower integration (optional). Kept minimal: just the service + http traits.
+tower-service = { version = "0.3", optional = true }
+# HTTP types used by RequestContext — pulled in by hyper or tower features.
+# Lightweight (just bytes + itoa, both already transitive), but kept optional
+# so protocol+json users don't pay for it.
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[[example]]
+name = "hyper_demo"
+required-features = ["hyper", "http-client"]
+
+[[example]]
+name = "uds_demo"
+required-features = ["server", "client", "netstring", "tokio"]
+
+[[example]]
+name = "gateway_demo"
+required-features = ["server", "http-client", "hyper", "netstring", "tokio"]
+
+[package.metadata.docs.rs]
+features = ["server", "client", "transport", "netstring", "newline", "tokio", "hyper", "tower", "http-client"]
+rustdoc-args = ["--cfg", "docsrs"]

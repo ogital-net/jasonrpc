@@ -1,0 +1,42 @@
+# cargo-deny configuration for jasonrpc.
+# Run: cargo deny check
+# Reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Evaluate the deny rules for every combination of features, not just the
+# default build. This catches transitive deps that only appear under optional
+# features (hyper, tower, http-client, etc.).
+all-features = false   # can't use `true` — backends are mutually exclusive.
+# Instead we rely on the CI matrix (each backend + integration feature set).
+
+# ---------------------------------------------------------------------------
+[advisories]
+# The OSV/RustSec database. Fail on any unignored vulnerability.
+version = 2
+ignore = []
+
+# ---------------------------------------------------------------------------
+[licenses]
+# Only allow explicitly permissive licenses.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+]
+
+# ---------------------------------------------------------------------------
+[bans]
+# Deny exact duplicates (same crate, different versions) where possible.
+multiple-versions = "warn"   # warn rather than deny — hyper/tower ecosystem
+                              # commonly has temporary version splits.
+wildcards = "deny"            # no `*` version reqs in our own Cargo.toml.
+highlight = "simplest-path"
+
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

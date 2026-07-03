@@ -1,0 +1,68 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fail fast if the git tag doesn't match Cargo.toml's version field.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::Tag version ($tag) does not match Cargo.toml version ($manifest)"
+            exit 1
+          fi
+
+      # Mirror CI — a green tag push means "these all passed on the commit that
+      # was tagged", but rerunning here guards against a dirty local publish.
+      - name: Test (serde_json backend, full feature set)
+        run: >
+          cargo test
+          --features "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+          --verbose
+
+      - name: Test (sonic backend)
+        run: >
+          cargo test --no-default-features
+          --features "backend-sonic,server,client,transport,netstring,newline,tokio"
+          --verbose
+
+      - name: Spec conformance (serde_json)
+        run: cargo test --test spec_conformance --features "server,tokio"
+
+      - name: Spec conformance (sonic)
+        run: >
+          cargo test --test spec_conformance --no-default-features
+          --features "backend-sonic,server,tokio"
+
+      - name: Doc tests
+        run: >
+          cargo test --doc
+          --features "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+
+      - name: Dry-run package
+        run: cargo package --verbose
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --verbose

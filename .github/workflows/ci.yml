@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+# The two backends are mutually exclusive (a compile_error! enforces this), so
+# we can never use --all-features. The matrix below runs every meaningful
+# combination: default backend + full integration stack, and sonic backend +
+# transport/server/client stack.
+
+jobs:
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (${{ matrix.os }} / ${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          # serde_json backend with all integrations
+          - label: serde_json
+            features: "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+            extra_flags: ""
+          # sonic-rs backend — integrations that don't require hyper
+          - label: sonic
+            features: "backend-sonic,server,client,transport,netstring,newline,tokio"
+            extra_flags: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo clippy --all-targets
+          ${{ matrix.extra_flags }}
+          --features "${{ matrix.features }}"
+          -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - label: serde_json
+            features: "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+            extra_flags: ""
+          - label: sonic
+            features: "backend-sonic,server,client,transport,netstring,newline,tokio"
+            extra_flags: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo test
+          ${{ matrix.extra_flags }}
+          --features "${{ matrix.features }}"
+
+  # ---------------------------------------------------------------------------
+  # Spec-conformance golden tests driven under each backend independently.
+  # These are the backend-parity check: the same Section 7 inputs, same output.
+  spec-conformance:
+    name: spec conformance (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: serde_json
+            features: "server,tokio"
+            extra_flags: ""
+          - label: sonic
+            features: "backend-sonic,server,tokio"
+            extra_flags: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo test --test spec_conformance
+          ${{ matrix.extra_flags }}
+          --features "${{ matrix.features }}"
+
+  # ---------------------------------------------------------------------------
+  # Default build only (no extra features): confirms the minimal use case and
+  # the no-backend compile_error guard.
+  test-default-features:
+    name: test (default features only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  # ---------------------------------------------------------------------------
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # docs.rs uses `all-features = true` (Cargo.toml), which for this crate
+      # resolves to the serde_json backend + all integrations. The sonic backend
+      # is excluded from docs.rs because the backends are mutually exclusive.
+      - run: >
+          cargo doc --no-deps
+          --features "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: msrv (1.82)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82
+      - uses: Swatinem/rust-cache@v2
+      # MSRV is verified against the default build (serde_json backend). Optional
+      # integrations (hyper, tower, http-client) track hyper's own MSRV, which
+      # may advance independently; consumers enabling those features must follow.
+      - run: cargo check
+      - run: cargo check --features "server,client,transport,netstring,newline,tokio"
+
+  # ---------------------------------------------------------------------------
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
