@@ -66,46 +66,44 @@ struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = AppState::default();
 
-    let router = Arc::new(
-        Router::with_state(state)
-            // Positional params `[a, b]`, returning a plain `i64` directly.
-            .register("add", |st: AppState, req: Request| async move {
-                st.calls.fetch_add(1, Ordering::Relaxed);
-                let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
-                Ok(a + b)
+    let router = Router::with_state(state)
+        // Positional params `[a, b]`, returning a plain `i64` directly.
+        .register("add", |st: AppState, req: Request| async move {
+            st.calls.fetch_add(1, Ordering::Relaxed);
+            let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+            Ok(a + b)
+        })
+        // Fallible method: division that rejects a zero divisor with a
+        // domain-specific server error.
+        .register("divide", |st: AppState, req: Request| async move {
+            st.calls.fetch_add(1, Ordering::Relaxed);
+            let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+            if b == 0 {
+                return Err(Error::server_error(-32001, "division by zero"));
+            }
+            Ok(a / b)
+        })
+        // By-name params returning a struct directly, reading shared state.
+        .register("greet", |st: AppState, req: Request| async move {
+            let n = st.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            let p: GreetParams = req.params_as().ok_or_else(Error::invalid_params)?;
+            let hello = if p.formal { "Good day" } else { "Hi" };
+            Ok(Greeting {
+                message: format!("{hello}, {}!", p.name),
+                call_count: n,
             })
-            // Fallible method: division that rejects a zero divisor with a
-            // domain-specific server error.
-            .register("divide", |st: AppState, req: Request| async move {
-                st.calls.fetch_add(1, Ordering::Relaxed);
-                let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
-                if b == 0 {
-                    return Err(Error::server_error(-32001, "division by zero"));
-                }
-                Ok(a / b)
-            })
-            // By-name params returning a struct directly, reading shared state.
-            .register("greet", |st: AppState, req: Request| async move {
-                let n = st.calls.fetch_add(1, Ordering::Relaxed) + 1;
-                let p: GreetParams = req.params_as().ok_or_else(Error::invalid_params)?;
-                let hello = if p.formal { "Good day" } else { "Hi" };
-                Ok(Greeting {
-                    message: format!("{hello}, {}!", p.name),
-                    call_count: n,
-                })
-            }),
-    );
+        });
 
     // Bind and serve in the background.
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
-    let server_router = Arc::clone(&router);
+    let server_router = router.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
-            let svc = HyperService::new(Arc::clone(&server_router));
+            let svc = HyperService::new(server_router.clone());
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let _ = http1::Builder::new().serve_connection(io, svc).await;

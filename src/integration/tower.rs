@@ -13,7 +13,6 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use ::http::{header, Request as HttpRequest, Response as HttpResponse, StatusCode};
@@ -30,20 +29,18 @@ pub type ResponseBody = Full<Bytes>;
 
 /// A cloneable tower [`Service`] that dispatches JSON-RPC over HTTP.
 ///
-/// Wraps a shared [`Router`]; cloning only bumps the `Arc`. Dispatch is by
-/// JSON-RPC `method` — the HTTP path and verb are ignored, so mount it at a
-/// single route.
+/// Wraps a [`Router`]; cloning is cheap (the router's method table is shared
+/// behind an `Arc`). Dispatch is by JSON-RPC `method` — the HTTP path and verb
+/// are ignored, so mount it at a single route.
 ///
 /// ```
-/// use std::sync::Arc;
 /// use jasonrpc::server::Router;
 /// use jasonrpc::integration::tower::RpcService;
 ///
-/// let router = Arc::new(Router::new());
-/// let _service = RpcService::new(Arc::clone(&router));
+/// let _service = RpcService::new(Router::new());
 /// ```
 pub struct RpcService<S> {
-    router: Arc<Router<S>>,
+    router: Router<S>,
 }
 
 impl<S> std::fmt::Debug for RpcService<S> {
@@ -53,16 +50,16 @@ impl<S> std::fmt::Debug for RpcService<S> {
 }
 
 impl<S> RpcService<S> {
-    /// Wrap a shared router in a tower service.
-    pub fn new(router: Arc<Router<S>>) -> Self {
+    /// Wrap a router in a tower service.
+    pub fn new(router: Router<S>) -> Self {
         Self { router }
     }
 }
 
-impl<S> Clone for RpcService<S> {
+impl<S: Clone> Clone for RpcService<S> {
     fn clone(&self) -> Self {
         Self {
-            router: Arc::clone(&self.router),
+            router: self.router.clone(),
         }
     }
 }
@@ -82,7 +79,7 @@ where
     }
 
     fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
-        let router = Arc::clone(&self.router);
+        let router = self.router.clone();
         Box::pin(async move {
             // Split to preserve extensions and headers before collecting the body.
             let (parts, body) = req.into_parts();
@@ -126,12 +123,10 @@ mod tests {
     use crate::json::Value;
     use crate::protocol::Request;
 
-    fn router() -> Arc<Router<()>> {
-        Arc::new(
-            Router::new().register(
-                "ping",
-                |_, _req: Request| async move { Ok(Value::from("pong")) },
-            ),
+    fn router() -> Router<()> {
+        Router::new().register(
+            "ping",
+            |_, _req: Request| async move { Ok(Value::from("pong")) },
         )
     }
 

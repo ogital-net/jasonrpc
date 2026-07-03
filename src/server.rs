@@ -162,6 +162,13 @@ where
 /// `S` is cloned once per dispatched request, so make it cheap to clone
 /// (typically an `Arc<...>` or a handle). For a stateless server use `()`.
 ///
+/// # Cloning
+///
+/// [`Router`] is cheap to clone when `S` is: the method table lives behind an
+/// [`Arc`], so a clone only bumps that reference count and clones the state
+/// handle. This makes it easy to hand a router to many connections or tasks
+/// without wrapping it in an extra `Arc` yourself:
+///
 /// ```
 /// use jasonrpc::server::Router;
 /// use jasonrpc::{Error, Request};
@@ -170,20 +177,45 @@ where
 ///     .register("ping", |_, _req: Request| async move {
 ///         Ok::<_, Error>("pong")
 ///     });
+///
+/// let per_connection = router.clone(); // just an Arc bump + state clone
+/// # let _ = per_connection;
 /// ```
 pub struct Router<S = ()> {
     state: S,
-    methods: HashMap<String, Method<S>>,
+    methods: Arc<HashMap<String, Method<S>>>,
     /// Maximum number of entries allowed in a single batch, or `None` for no
     /// limit. Batches larger than this are rejected with a single Invalid
     /// Request response.
     max_batch_len: Option<usize>,
 }
 
+impl<S: Clone> Clone for Router<S> {
+    /// Cheap clone: bumps the method table's [`Arc`] and clones the state
+    /// handle. Does not duplicate the registered handlers.
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            methods: Arc::clone(&self.methods),
+            max_batch_len: self.max_batch_len,
+        }
+    }
+}
+
 /// A registered method — either context-free or context-aware.
 enum Method<S> {
     Handler(Arc<dyn Handler<S>>),
     WithContext(Arc<dyn HandlerWithContext<S>>),
+}
+
+// Hand-written so cloning a `Method` (an `Arc` bump) never requires `S: Clone`.
+impl<S> Clone for Method<S> {
+    fn clone(&self) -> Self {
+        match self {
+            Method::Handler(h) => Method::Handler(Arc::clone(h)),
+            Method::WithContext(h) => Method::WithContext(Arc::clone(h)),
+        }
+    }
 }
 
 impl<S> Method<S> {
@@ -214,7 +246,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     pub fn with_state(state: S) -> Self {
         Self {
             state,
-            methods: HashMap::new(),
+            methods: Arc::new(HashMap::new()),
             max_batch_len: None,
         }
     }
@@ -253,8 +285,9 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         handler: H,
     ) -> Self {
         let name = method.into();
-        if self
-            .methods
+        // Copy-on-write: mutate in place while uniquely held (the common
+        // builder case), otherwise clone the shared table first.
+        if Arc::make_mut(&mut self.methods)
             .insert(name.clone(), Method::Handler(Arc::new(handler)))
             .is_some()
         {
@@ -280,8 +313,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         handler: H,
     ) -> Self {
         let name = method.into();
-        if self
-            .methods
+        if Arc::make_mut(&mut self.methods)
             .insert(name.clone(), Method::WithContext(Arc::new(handler)))
             .is_some()
         {
@@ -616,5 +648,60 @@ mod tests {
             .await;
         let s = String::from_utf8(out.to_bytes().unwrap().unwrap()).unwrap();
         assert!(s.contains("\"result\":19"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn cloned_router_shares_handlers_and_dispatches() {
+        let r = router().with_max_batch_len(5);
+        let clone = r.clone();
+
+        // The clone shares the same method table (Arc bump, not a deep copy).
+        assert!(Arc::ptr_eq(&r.methods, &clone.methods));
+        // ...and config is carried over.
+        assert_eq!(clone.max_batch_len, Some(5));
+
+        // Both dispatch identically.
+        let out = clone
+            .handle_bytes(br#"{"jsonrpc":"2.0","method":"subtract","params":[42,23],"id":1}"#)
+            .await;
+        let s = String::from_utf8(out.to_bytes().unwrap().unwrap()).unwrap();
+        assert!(s.contains("\"result\":19"), "{s}");
+    }
+
+    #[test]
+    fn clone_then_register_is_copy_on_write() {
+        // Registering on a clone must not mutate the original's shared table.
+        let base = router();
+        let extended = base
+            .clone()
+            .register("extra", |_, _req: Request| async move { Ok("ok") });
+
+        // The two now point at distinct tables.
+        assert!(!Arc::ptr_eq(&base.methods, &extended.methods));
+        assert!(base.methods.get("extra").is_none());
+        assert!(extended.methods.get("extra").is_some());
+    }
+
+    #[tokio::test]
+    async fn router_clone_works_with_arc_state() {
+        // A realistic server: shared state behind an Arc, router cloned per task.
+        let router = Router::with_state(Arc::new(7_i64)).register(
+            "get",
+            |state: Arc<i64>, _req: Request| async move { Ok(*state) },
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let r = router.clone();
+            handles.push(tokio::spawn(async move {
+                let out = r
+                    .handle_bytes(br#"{"jsonrpc":"2.0","method":"get","id":1}"#)
+                    .await;
+                String::from_utf8(out.to_bytes().unwrap().unwrap()).unwrap()
+            }));
+        }
+        for h in handles {
+            assert!(h.await.unwrap().contains("\"result\":7"));
+        }
     }
 }

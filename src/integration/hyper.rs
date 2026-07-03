@@ -2,7 +2,7 @@
 //!
 //! Small services that use `hyper` directly are supported directly. This
 //! module keeps the adapter minimal: a [`Router`] plus a request body becomes
-//! a JSON-RPC response body, and [`HyperService`] adapts a shared router into a
+//! a JSON-RPC response body, and [`HyperService`] adapts a router into a
 //! `hyper::service::Service` you can hand to a connection.
 //!
 //! The design deliberately does no routing on the HTTP path/verb: a JSON-RPC
@@ -11,7 +11,6 @@
 //! example -- so this stays a pure protocol adapter.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -44,7 +43,7 @@ pub type ResponseBody = Full<Bytes>;
 /// This function is infallible (`Error = Infallible`); the `Result` return
 /// type is for compatibility with the `Service` trait.
 pub(crate) async fn serve_request<S>(
-    router: Arc<Router<S>>,
+    router: Router<S>,
     req: HttpRequest<Incoming>,
 ) -> Result<HttpResponse<ResponseBody>, Infallible>
 where
@@ -89,27 +88,26 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> HttpResponse<ResponseBody
         .expect("valid json response")
 }
 
-/// A cloneable `hyper` service wrapping a shared [`Router`].
+/// A cloneable `hyper` service wrapping a [`Router`].
 ///
-/// Hand this to `hyper::server::conn::*` per connection. Cloning is cheap: it
-/// only bumps the `Arc`.
+/// Hand this to `hyper::server::conn::*` per connection. Cloning is cheap: the
+/// router's method table is shared behind an `Arc`, so a clone only bumps that
+/// reference count and clones the state handle.
 ///
 /// ```
-/// use std::sync::Arc;
 /// use jasonrpc::server::Router;
 /// use jasonrpc::integration::hyper::HyperService;
 ///
-/// let router = Arc::new(Router::new());
-/// let _service = HyperService::new(Arc::clone(&router));
+/// let _service = HyperService::new(Router::new());
 /// ```
 pub struct HyperService<S> {
-    router: Arc<Router<S>>,
+    router: Router<S>,
 }
 
-impl<S> Clone for HyperService<S> {
+impl<S: Clone> Clone for HyperService<S> {
     fn clone(&self) -> Self {
         Self {
-            router: Arc::clone(&self.router),
+            router: self.router.clone(),
         }
     }
 }
@@ -121,8 +119,8 @@ impl<S> std::fmt::Debug for HyperService<S> {
 }
 
 impl<S> HyperService<S> {
-    /// Wrap a shared router.
-    pub fn new(router: Arc<Router<S>>) -> Self {
+    /// Wrap a router.
+    pub fn new(router: Router<S>) -> Self {
         Self { router }
     }
 }
@@ -138,7 +136,7 @@ where
     >;
 
     fn call(&self, req: HttpRequest<Incoming>) -> Self::Future {
-        let router = Arc::clone(&self.router);
+        let router = self.router.clone();
         Box::pin(serve_request(router, req))
     }
 }
@@ -166,7 +164,7 @@ mod tests {
     /// The real `serve_request` takes `Incoming` specifically; this test helper
     /// exercises the same internal `http::dispatch` path.
     async fn serve_test_request<S>(
-        router: Arc<Router<S>>,
+        router: &Router<S>,
         req: HttpRequest<TestBody>,
     ) -> HttpResponse<ResponseBody>
     where
@@ -176,7 +174,7 @@ mod tests {
             Ok(collected) => collected.to_bytes(),
             Err(_) => return json_response(StatusCode::OK, http::parse_error_body()),
         };
-        let HttpOutcome { status, body } = http::dispatch(&router, &body).await;
+        let HttpOutcome { status, body } = http::dispatch(router, &body).await;
         if status == 204 {
             HttpResponse::builder()
                 .status(StatusCode::NO_CONTENT)
@@ -190,14 +188,12 @@ mod tests {
 
     #[tokio::test]
     async fn valid_call_returns_200() {
-        let router = Arc::new(
-            Router::new().register("ping", |(), _req: Request| async move {
-                Ok::<_, crate::Error>("pong")
-            }),
-        );
+        let router = Router::new().register("ping", |(), _req: Request| async move {
+            Ok::<_, crate::Error>("pong")
+        });
 
         let body = br#"{"jsonrpc":"2.0","method":"ping","id":1}"#;
-        let resp = serve_test_request(Arc::clone(&router), json_req(body)).await;
+        let resp = serve_test_request(&router, json_req(body)).await;
         assert_eq!(resp.status(), 200);
 
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
@@ -207,22 +203,20 @@ mod tests {
 
     #[tokio::test]
     async fn notification_returns_204() {
-        let router = Arc::new(
-            Router::new().register("log", |(), _req: Request| async move {
-                Ok::<_, crate::Error>(())
-            }),
-        );
+        let router = Router::new().register("log", |(), _req: Request| async move {
+            Ok::<_, crate::Error>(())
+        });
 
         let body = br#"{"jsonrpc":"2.0","method":"log"}"#;
-        let resp = serve_test_request(Arc::clone(&router), json_req(body)).await;
+        let resp = serve_test_request(&router, json_req(body)).await;
         assert_eq!(resp.status(), 204);
     }
 
     #[tokio::test]
     async fn invalid_json_returns_parse_error() {
-        let router = Arc::new(Router::new());
+        let router = Router::new();
 
-        let resp = serve_test_request(Arc::clone(&router), json_req(b"not json")).await;
+        let resp = serve_test_request(&router, json_req(b"not json")).await;
         assert_eq!(resp.status(), 200);
 
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
@@ -232,10 +226,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_method_returns_error() {
-        let router = Arc::new(Router::new());
+        let router = Router::new();
 
         let body = br#"{"jsonrpc":"2.0","method":"nope","id":1}"#;
-        let resp = serve_test_request(Arc::clone(&router), json_req(body)).await;
+        let resp = serve_test_request(&router, json_req(body)).await;
         assert_eq!(resp.status(), 200);
 
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
