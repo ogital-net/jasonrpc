@@ -9,7 +9,7 @@
 //!
 //! ```sh
 //! cargo run --example gateway_demo \
-//!     --features "server,http-client,hyper,netstring,tokio"
+//!     --features "server,http-client,hyper,uds,netstring,tokio"
 //! ```
 //!
 //! Topology:
@@ -30,12 +30,13 @@
 //! 3. **Client** -- the built-in [`HttpTransport`] with an `Authorization`
 //!    header, calling the gateway as if it were the service.
 //!
-//! The interesting bit is **id rewriting**. Every HTTP client starts its own id
-//! sequence at 1, but they all share one multiplexed upstream connection whose
-//! correlation map is keyed by id. So the gateway rewrites each inbound id to a
-//! process-unique id before forwarding, then restores the original id on the way
-//! back. This is exactly the kind of thing the transport-free `client` helpers
-//! (`Client` + `MultiplexTransport`) are meant to make easy.
+//! The **id rewriting** is the load-bearing detail. Every HTTP client starts its
+//! own id sequence at 1, but they all share one multiplexed upstream connection
+//! whose correlation map is keyed by id. So the gateway rewrites each inbound id
+//! to a process-unique id before forwarding, then restores the original id on
+//! the way back. The upstream connection is a [`UdsClient`]; its raw byte
+//! passthrough ([`round_trip_raw`](jasonrpc::client::Client::round_trip_raw))
+//! forwards a request without re-parsing it.
 
 #![allow(clippy::ignored_unit_patterns)]
 
@@ -49,9 +50,9 @@ use hyper::service::service_fn;
 use hyper::{Request as HttpRequest, Response as HttpResponse, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener};
 
-use jasonrpc::client::{Client, HttpTransport, MultiplexTransport};
+use jasonrpc::client::{Client, HttpTransport, UdsClient};
 use jasonrpc::protocol::{Id, Request, Response};
 use jasonrpc::server::Router;
 use jasonrpc::transport::io::FramedConn;
@@ -72,29 +73,28 @@ struct WhoAmI {
 // 1. Upstream: a plain jasonrpc server over a netstring-framed Unix socket.
 // ===========================================================================
 
-fn upstream_router() -> Arc<Router<()>> {
-    Arc::new(
-        Router::new()
-            .register("add", |_, req: Request| async move {
-                let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
-                Ok(a + b)
+fn upstream_router() -> Router<()> {
+    Router::new()
+        .register("add", |_, req: Request| async move {
+            let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+            Ok(a + b)
+        })
+        .register("whoami", |_, _req: Request| async move {
+            Ok(WhoAmI {
+                service: "upstream".into(),
+                pid: std::process::id(),
             })
-            .register("whoami", |_, _req: Request| async move {
-                Ok(WhoAmI {
-                    service: "upstream".into(),
-                    pid: std::process::id(),
-                })
-            })
-            .register("boom", |_, _req: Request| async move {
-                Err::<(), _>(Error::server_error(-32020, "upstream failure"))
-            }),
-    )
+        })
+        .register("boom", |_, _req: Request| async move {
+            Err::<(), _>(Error::server_error(-32020, "upstream failure"))
+        })
 }
 
 async fn run_upstream(listener: UnixListener) {
     let router = upstream_router();
     while let Ok((stream, _)) = listener.accept().await {
-        let router = Arc::clone(&router);
+        // Each connection gets a cheap clone (shared method table behind an Arc).
+        let router = router.clone();
         tokio::spawn(async move {
             let mut conn = FramedConn::new(stream, Netstring);
             while let Ok(Some(frame)) = conn.recv().await {
@@ -118,7 +118,9 @@ async fn run_upstream(listener: UnixListener) {
 /// process-unique id allocator for rewriting.
 #[derive(Clone)]
 struct Gateway {
-    upstream: Arc<Client<MultiplexTransport<tokio::io::WriteHalf<UnixStream>, Netstring>>>,
+    // `UdsClient<Netstring>` is the multiplexed Unix-socket client; it is not
+    // itself `Clone` (each client owns its id sequence), so share it via `Arc`.
+    upstream: Arc<UdsClient<Netstring>>,
     next_id: Arc<AtomicI64>,
 }
 
@@ -230,8 +232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 2. Dial the upstream once and multiplex all gateway traffic over it.
     //    Set a request timeout so a hung upstream doesn't block all callers.
-    let stream = UnixStream::connect(&sock).await?;
-    let upstream = Client::new(MultiplexTransport::new(stream, Netstring))
+    let upstream = UdsClient::connect(&sock, Netstring)
+        .await?
         .with_request_timeout(Duration::from_secs(10));
     let gw = Gateway {
         upstream: Arc::new(upstream),

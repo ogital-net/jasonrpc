@@ -106,11 +106,11 @@ required-features = ["hyper", "http-client"]
 
 [[example]]
 name = "uds_demo"
-required-features = ["server", "client", "netstring", "tokio"]
+required-features = ["server", "client", "uds", "netstring", "tokio"]
 
 [[example]]
 name = "gateway_demo"
-required-features = ["server", "http-client", "hyper", "netstring", "tokio"]
+required-features = ["server", "http-client", "hyper", "uds", "netstring", "tokio"]
 
 # Dispatch/serialization microbenchmarks. Compiles under whichever JSON backend
 # is selected, so the same bench runs against both for a head-to-head compare

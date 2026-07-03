@@ -117,16 +117,20 @@ let sum: i64 = client.call("add", (1, 2)).await?;
 ### Byte-forwarding (e.g. an HTTP -> UDS proxy)
 
 ```rust,ignore
-use jasonrpc::client::{Client, MultiplexTransport};
+use jasonrpc::client::UdsClient;
 use jasonrpc::transport::Netstring;
 
-// One long-lived multiplexed connection to the upstream
-let mux = MultiplexTransport::new(upstream_socket, Netstring);
-let upstream = Client::new(mux);
+// One long-lived multiplexed connection to the upstream.
+let upstream = UdsClient::connect("/run/upstream.sock", Netstring).await?;
 
-// Proxy raw bytes: rewrite ids, forward, restore ids on reply
+// Proxy raw bytes: rewrite ids, forward, restore ids on reply — no re-parsing.
 let reply = upstream.round_trip_raw(request_bytes).await?;
 ```
+
+For a stream you already hold (not a socket path), wrap it yourself with
+`Client::new(MultiplexTransport::new(stream, framing))`; `UdsClient` is the
+shortcut for the common Unix-socket case. See the `gateway_demo` example for a
+full HTTP-to-UDS proxy with id rewriting.
 
 ## JSON backends
 

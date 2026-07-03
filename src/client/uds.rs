@@ -95,14 +95,14 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
 
-        let router = Arc::new(Router::new().register("add", |_, req: Request| async move {
+        let router = Router::new().register("add", |_, req: Request| async move {
             let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
             Ok(a + b)
-        }));
+        });
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let router = Arc::clone(&router);
+                let router = router.clone();
                 tokio::spawn(async move {
                     let mut conn = FramedConn::new(stream, Netstring);
                     while let Ok(Some(frame)) = conn.recv().await {
