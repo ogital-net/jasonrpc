@@ -1,14 +1,10 @@
-//! Batteries-included Unix-domain-socket client.
+//! Unix-domain-socket client.
 //!
-//! [`UdsClient`] is the one-call path from a socket path to a ready
-//! [`Client`]: it connects a [`UnixStream`], wraps it in a
-//! [`MultiplexTransport`] (so many concurrent calls share the one connection),
-//! and hands back a `Client` you can `call`/`notify` on. This is the non-HTTP
-//! counterpart to [`HttpTransport`](super::HttpTransport) and removes the
-//! connect-then-frame-then-wrap boilerplate.
+//! [`UdsClient`] is a [`Client`] over a [`MultiplexTransport`] backed by a
+//! [`UnixStream`]. The [`connect`](UdsClient::connect) constructor establishes
+//! the connection and installs the framing in one call.
 //!
-//! Unix-only; the module is compiled only on `unix` targets with the `uds`
-//! feature enabled.
+//! This module is available on `unix` targets with the `uds` feature enabled.
 
 use tokio::net::UnixStream;
 
@@ -17,11 +13,12 @@ use crate::transport::Framing;
 
 /// A multiplexed JSON-RPC client over a Unix-domain socket.
 ///
-/// This is a type alias for the concrete [`Client`] the [`connect`] constructor
-/// builds, so all the usual [`Client`] methods (`call`, `notify`,
-/// `round_trip_raw`, `with_request_timeout`, ...) are available. To share it
-/// across tasks, wrap it in an `Arc` — concurrent calls are multiplexed over
-/// the single underlying connection and correlated by id.
+/// A type alias for the [`Client`] produced by
+/// [`connect`](UdsClient::connect); all [`Client`] methods (`call`, `notify`,
+/// `round_trip_raw`, `with_request_timeout`) apply. Calls are multiplexed over
+/// a single connection and correlated by id, so concurrent calls may be issued
+/// by wrapping the client in an [`Arc`](std::sync::Arc) and sharing it across
+/// tasks.
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,22 +31,20 @@ use crate::transport::Framing;
 /// # Ok(())
 /// # }
 /// ```
-///
-/// [`connect`]: UdsClient::connect
 pub type UdsClient<F> = Client<MultiplexOver<UnixStream, F>>;
 
 impl<F> Client<MultiplexOver<UnixStream, F>>
 where
     F: Framing + Clone + Send + Sync + 'static,
 {
-    /// Connect to the Unix socket at `path` and build a multiplexed client
-    /// using `framing`.
+    /// Connects to the Unix socket at `path` and returns a client that frames
+    /// messages with `framing`.
     ///
-    /// Opens one long-lived connection and spawns the background reader that
-    /// correlates replies by id, so concurrent calls (and clones of the
-    /// returned client) all share it. Pair with
-    /// [`with_request_timeout`](Client::with_request_timeout) to bound calls
-    /// against a slow or hung peer.
+    /// The connection is long-lived: a background task reads replies and
+    /// correlates them to callers by id, so the returned client (and any
+    /// clones sharing it) multiplex their calls over it. Use
+    /// [`with_request_timeout`](Client::with_request_timeout) to bound a call
+    /// against an unresponsive peer.
     ///
     /// # Errors
     ///
@@ -92,8 +87,8 @@ mod tests {
     /// `sockaddr_un` paths at ~104 bytes, so a nanosecond timestamp is too long).
     static SOCK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    /// A minimal netstring-framed UDS server backed by a `Router`, for exercising
-    /// the batteries-included client end to end.
+    /// A minimal netstring-framed UDS server backed by a `Router`, used to
+    /// exercise the client end to end.
     async fn spawn_server() -> std::path::PathBuf {
         let seq = SOCK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sock = std::env::temp_dir().join(format!("jrpc-uds-{}-{seq}.sock", std::process::id()));

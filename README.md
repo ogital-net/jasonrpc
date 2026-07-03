@@ -103,8 +103,8 @@ client.notify("shutdown", ()).await?;
 
 ### Unix-socket client
 
-One call connects, frames, and multiplexes — no manual `UnixStream`/transport
-wiring (`uds` feature):
+`UdsClient::connect` establishes the connection and installs the framing in one
+call, over a multiplexed connection (`uds` feature):
 
 ```rust,ignore
 use jasonrpc::client::UdsClient;
@@ -184,7 +184,7 @@ cargo test --test spec_conformance --features "server,tokio"
 | `netstring` | -- | Netstring framing (`transport`) |
 | `newline` | -- | Newline-delimited framing (`transport`) |
 | `tokio` | `tokio` | Async I/O helpers (`transport`) |
-| `uds` | `tokio` | `UdsClient`: batteries-included Unix-socket client (`client`) |
+| `uds` | `tokio` | `UdsClient`: Unix-socket client (`client`) |
 | `hyper` | `hyper` | `HyperService` adapter (`server`) |
 | `tower` | `tower-service`, `http`, `http-body` | `RpcService` adapter (`server`) |
 | `http-client` | `hyper`, `hyper-util` | `HttpTransport` (`client`) |

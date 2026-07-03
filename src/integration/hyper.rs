@@ -1,14 +1,13 @@
 //! Hyper integration.
 //!
-//! Small services that use `hyper` directly are supported directly. This
-//! module keeps the adapter minimal: a [`Router`] plus a request body becomes
-//! a JSON-RPC response body, and [`HyperService`] adapts a router into a
-//! `hyper::service::Service` you can hand to a connection.
+//! [`HyperService`] adapts a [`Router`] into a `hyper::service::Service`: it
+//! collects a request body, dispatches it through the router, and builds the
+//! JSON-RPC response body.
 //!
-//! The design deliberately does no routing on the HTTP path/verb: a JSON-RPC
-//! endpoint is a single POST target and all dispatch happens by `method`. AAA
-//! (authn/authz/accounting) belongs in a layer *around* this -- see the gateway
-//! example -- so this stays a pure protocol adapter.
+//! Dispatch does not consider the HTTP path or verb. A JSON-RPC endpoint is a
+//! single POST target and all dispatch happens by `method`, so authentication,
+//! authorization, and accounting belong in a layer around this service (see the
+//! gateway example) rather than within it.
 
 use std::convert::Infallible;
 

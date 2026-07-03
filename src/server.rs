@@ -121,10 +121,10 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<JsonRawValue, Error>
 /// a result value or a protocol [`Error`]. Handlers are invoked for both calls
 /// and notifications; the router discards the output for notifications.
 ///
-/// You rarely implement this trait directly: any async closure
+/// This trait is rarely implemented directly: any async closure
 /// `Fn(S, Request) -> impl Future<Output = Result<T, Error>>` where `T:
-/// Serialize` is a handler. The result is serialized for you, so a handler can
-/// return an `i64`, a `String`, a `#[derive(Serialize)]` struct, or a
+/// Serialize` is a handler. The result is serialized on return, so a handler
+/// may return an `i64`, a `String`, a `#[derive(Serialize)]` struct, or a
 /// [`Value`] directly.
 pub trait Handler<S>: Send + Sync {
     /// Invoke the handler, resolving to the JSON result value or an error.
@@ -271,11 +271,11 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         }
     }
 
-    /// Borrow the router's shared state.
+    /// Returns a reference to the router's shared state.
     ///
-    /// Handy when the state handle (typically an `Arc<...>`) is needed outside
-    /// the router — for example to drive background work with the same shared
-    /// state the handlers see. Clone it if you need an owned copy.
+    /// Useful when the state handle (typically an `Arc<...>`) is needed outside
+    /// the router, for example to drive background work with the same state the
+    /// handlers see. Clone the reference for an owned copy.
     ///
     /// ```
     /// use std::sync::Arc;

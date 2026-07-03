@@ -1,14 +1,13 @@
-//! Batteries-included HTTP client transport.
+//! HTTP client transport.
 //!
 //! [`HttpTransport`] implements [`Transport`](super::Transport) by `POST`ing the
-//! request bytes to a single JSON-RPC endpoint URL. It is built on `hyper` plus
-//! `hyper-util`'s pooled `Client` -- the same foundation `reqwest` sits on, but
-//! without the higher-level machinery (redirects, cookies, TLS opinions) that a
-//! control-socket / gateway workload doesn't want.
+//! request bytes to a single JSON-RPC endpoint URL. It is built on `hyper` and
+//! `hyper-util`'s pooled `Client`, without higher-level HTTP machinery such as
+//! redirects, cookies, or TLS.
 //!
-//! For plain HTTP this is all you need. TLS and Unix-socket connectors can be
-//! layered on later by generalizing over the `hyper_util` connector; the public
-//! surface here is intentionally small so that stays backwards-compatible.
+//! The transport speaks plain HTTP. The public surface is deliberately small,
+//! leaving room to add TLS or Unix-socket connectors by generalizing over the
+//! `hyper_util` connector without a breaking change.
 
 use std::error::Error as StdError;
 
@@ -30,12 +29,11 @@ pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 
 /// A pooled HTTP transport that POSTs JSON-RPC messages to one endpoint.
 ///
-/// Cloning is cheap and shares the underlying connection pool, so construct one
-/// and reuse it (or wrap it in a [`Client`](super::Client)).
+/// Cloning shares the underlying connection pool, so a single transport can be
+/// constructed and reused (or wrapped in a [`Client`](super::Client)).
 ///
-/// Default headers set via [`with_header`](Self::with_header) ride on every
-/// request -- handy for a static `Authorization` token when talking to an
-/// upstream that expects one.
+/// Default headers set via [`with_header`](Self::with_header) are sent on every
+/// request, for example a static `Authorization` token.
 #[derive(Clone, Debug)]
 pub struct HttpTransport {
     client: HyperClient<HttpConnector, Full<Bytes>>,

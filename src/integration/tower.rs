@@ -3,12 +3,13 @@
 //! [`RpcService`] is a [`tower_service::Service`] that maps an
 //! `http::Request<B>` to an `http::Response<Full<Bytes>>` by dispatching the
 //! request body through a [`Router`]. Because it speaks the generic `http` and
-//! `http-body` traits (not hyper's concrete types), it slots straight into an
-//! axum `Router` via `route_service`, or anywhere a tower `Service` is expected.
+//! `http-body` traits rather than hyper's concrete types, it can be mounted in
+//! an axum `Router` via `route_service`, or used anywhere a tower `Service` is
+//! expected.
 //!
-//! Kept dependency-light on purpose: this pulls in only `tower-service`, `http`,
-//! and `http-body`, not the whole `tower` crate. AAA and other cross-cutting
-//! concerns are added as tower layers *around* this service, not inside it.
+//! The integration depends only on `tower-service`, `http`, and `http-body`,
+//! not the whole `tower` crate. Cross-cutting concerns such as authentication
+//! are applied as tower layers around this service rather than within it.
 
 use std::convert::Infallible;
 use std::future::Future;
