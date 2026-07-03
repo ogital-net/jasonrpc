@@ -118,6 +118,30 @@ jobs:
       - run: cargo test
 
   # ---------------------------------------------------------------------------
+  # Compile the benchmarks under both backends (build only; not run in CI).
+  bench-build:
+    name: bench build (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: serde_json
+            features: "server,tokio,netstring"
+            extra_flags: ""
+          - label: sonic
+            features: "backend-sonic,server,tokio,netstring"
+            extra_flags: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo bench --bench dispatch --no-run
+          ${{ matrix.extra_flags }}
+          --features "${{ matrix.features }}"
+
+  # ---------------------------------------------------------------------------
   docs:
     name: rustdoc
     runs-on: ubuntu-latest

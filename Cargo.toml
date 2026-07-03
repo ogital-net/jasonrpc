@@ -13,6 +13,7 @@ include = [
     "src/**/*.rs",
     "tests/**/*.rs",
     "examples/**/*.rs",
+    "benches/**/*.rs",
     "Cargo.toml",
     "README.md",
     "LICENSE",
@@ -97,6 +98,7 @@ hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
+criterion = "0.5"
 
 [[example]]
 name = "hyper_demo"
@@ -109,6 +111,17 @@ required-features = ["server", "client", "netstring", "tokio"]
 [[example]]
 name = "gateway_demo"
 required-features = ["server", "http-client", "hyper", "netstring", "tokio"]
+
+# Dispatch/serialization microbenchmarks. Compiles under whichever JSON backend
+# is selected, so the same bench runs against both for a head-to-head compare
+# (see the header comment in benches/dispatch.rs).
+#
+# Intentionally no `required-features`: that would make a plain `cargo bench`
+# silently skip this target. Instead the bench compiles under any feature set
+# and, when the needed features are off, prints how to re-run.
+[[bench]]
+name = "dispatch"
+harness = false
 
 [package.metadata.docs.rs]
 features = ["server", "client", "transport", "netstring", "newline", "content-length", "tokio", "uds", "hyper", "tower", "http-client"]

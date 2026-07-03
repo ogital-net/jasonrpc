@@ -155,6 +155,31 @@ cargo run --example uds_demo --features "server,client,netstring,tokio"
 cargo run --example gateway_demo --features "server,http-client,hyper,netstring,tokio"
 ```
 
+## Benchmarks
+
+`benches/dispatch.rs` covers single/batch dispatch, request parse/build, and
+framing. The JSON backends are mutually exclusive, so the same bench is run once
+per backend and compared through criterion baselines — the baseline name carries
+the backend identity, and the benchmark ids match, so the second run prints a
+per-benchmark delta:
+
+```sh
+# serde_json backend — save its numbers under the `serde_json` baseline
+cargo bench --bench dispatch \
+    --features "server,tokio,netstring" -- --save-baseline serde_json
+
+# sonic-rs backend, diffed against the serde_json baseline
+cargo bench --bench dispatch --no-default-features \
+    --features "backend-sonic,server,tokio,netstring" -- --baseline serde_json
+```
+
+A plain `cargo bench` (no features) prints the command to re-run with the
+features the benchmark needs, rather than skipping silently.
+
+On x86-64, add `RUSTFLAGS="-C target-cpu=native"` for a fair `sonic-rs`
+comparison — the default `target-cpu` there is a conservative baseline (SSE2)
+that handicaps SIMD parsing. On aarch64, NEON is already enabled by default.
+
 ## Spec conformance
 
 Implements [JSON-RPC 2.0](https://www.jsonrpc.org/specification) to the letter:
