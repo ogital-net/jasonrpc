@@ -452,19 +452,21 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         req: Request,
         ctx: RequestContext,
     ) -> Option<Response> {
-        let is_notification = req.is_notification();
-        let id = req.id().cloned();
+        // Only clone the id when a response will be built; notifications
+        // discard it, so cloning first would waste an allocation for string
+        // ids on the notification path.
+        let id = if req.is_notification() {
+            None
+        } else {
+            Some(req.id().cloned().unwrap_or(Id::Null))
+        };
 
         let result = match self.methods.get(req.method()) {
             Some(handler) => handler.call(self.state.clone(), req, ctx).await,
             None => Err(Error::method_not_found()),
         };
 
-        if is_notification {
-            return None;
-        }
-
-        let id = id.unwrap_or(Id::Null);
+        let id = id?;
         Some(match result {
             Ok(raw) => Response::from_raw_result(id, raw),
             Err(error) => Response::error(id, error),
@@ -488,7 +490,8 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
 
     /// Process a batch with context.
     async fn handle_batch_bytes_with_context(&self, bytes: &[u8], ctx: RequestContext) -> Output {
-        let items: Vec<Vec<u8>> = if let Ok(items) = json::split_array(bytes) {
+        // Elements borrow from `bytes` — no per-element copy in the common case.
+        let items = if let Ok(items) = json::split_array(bytes) {
             items
         } else {
             let is_json = json::from_slice::<Value>(bytes).is_ok();
@@ -520,9 +523,9 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
             }
         }
 
-        let mut responses = Vec::new();
-        for item in items {
-            if let Some(resp) = self.handle_element_bytes_with_context(&item, &ctx).await {
+        let mut responses = Vec::with_capacity(items.len());
+        for item in &items {
+            if let Some(resp) = self.handle_element_bytes_with_context(item, &ctx).await {
                 responses.push(resp);
             }
         }

@@ -79,14 +79,17 @@ mod imp {
     }
 
     /// Split a JSON array into the raw bytes of each element, preserving each
-    /// element's exact serialization.
+    /// element's exact serialization. Each element borrows from `bytes`.
     #[cfg(feature = "server")]
-    pub fn split_array(bytes: &[u8]) -> Result<Vec<Vec<u8>>, JsonError> {
-        let raws: Vec<Box<serde_json::value::RawValue>> =
+    pub fn split_array(bytes: &[u8]) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, JsonError> {
+        // Borrow each element (`&RawValue`) directly out of the input rather
+        // than allocating a boxed copy per element; `get()` points back into
+        // `bytes`.
+        let raws: Vec<&serde_json::value::RawValue> =
             serde_json::from_slice(bytes).map_err(|e| JsonError(e.to_string()))?;
         Ok(raws
             .into_iter()
-            .map(|r| r.get().as_bytes().to_vec())
+            .map(|r| std::borrow::Cow::Borrowed(r.get().as_bytes()))
             .collect())
     }
 
@@ -130,14 +133,22 @@ mod imp {
     }
 
     /// Split a JSON array into the raw bytes of each element, preserving each
-    /// element's exact serialization.
+    /// element's exact serialization. Each element borrows from `bytes` when
+    /// the element's raw text is unescaped (the common case), otherwise it is
+    /// owned.
     #[cfg(feature = "server")]
-    pub fn split_array(bytes: &[u8]) -> Result<Vec<Vec<u8>>, JsonError> {
-        // `to_array_iter` lazily yields each element as a raw JSON slice.
+    pub fn split_array(bytes: &[u8]) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, JsonError> {
+        use std::borrow::Cow;
+        // `to_array_iter` lazily yields each element; `as_raw_cow` returns a
+        // slice borrowing from `bytes` (the `'de` lifetime) for raw input,
+        // owning only if the element required unescaping.
         let mut out = Vec::new();
         for item in sonic_rs::to_array_iter(bytes) {
             let raw = item.map_err(|e| JsonError(e.to_string()))?;
-            out.push(raw.as_raw_str().as_bytes().to_vec());
+            out.push(match raw.as_raw_cow() {
+                Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+                Cow::Owned(s) => Cow::Owned(s.into_bytes()),
+            });
         }
         Ok(out)
     }
@@ -246,9 +257,10 @@ pub(crate) fn string(s: &str) -> Value {
 
 /// Split a JSON array into the raw bytes of each element.
 ///
-/// Each returned buffer is the exact serialization of one element, so a batch
-/// entry can be re-parsed from its own bytes.
+/// Each returned element is the exact serialization of one array entry,
+/// borrowing from `bytes` where the backend allows, so a batch entry can be
+/// re-parsed from its own bytes without a copy in the common case.
 #[cfg(feature = "server")]
-pub(crate) fn split_array(bytes: &[u8]) -> Result<Vec<Vec<u8>>, JsonError> {
+pub(crate) fn split_array(bytes: &[u8]) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, JsonError> {
     imp::split_array(bytes)
 }
