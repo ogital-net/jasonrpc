@@ -54,7 +54,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-jasonrpc = { version = "0.2", features = ["server"] }
+jasonrpc = { version = "0.3", features = ["server"] }
 ```
 
 ### Server
