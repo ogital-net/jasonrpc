@@ -101,6 +101,19 @@ assert_eq!(sum, 3);
 client.notify("shutdown", ()).await?;
 ```
 
+### Unix-socket client
+
+One call connects, frames, and multiplexes — no manual `UnixStream`/transport
+wiring (`uds` feature):
+
+```rust,ignore
+use jasonrpc::client::UdsClient;
+use jasonrpc::transport::Netstring;
+
+let client = UdsClient::connect("/run/app.sock", Netstring).await?;
+let sum: i64 = client.call("add", (1, 2)).await?;
+```
+
 ### Byte-forwarding (e.g. an HTTP -> UDS proxy)
 
 ```rust,ignore
@@ -171,6 +184,7 @@ cargo test --test spec_conformance --features "server,tokio"
 | `netstring` | -- | Netstring framing (`transport`) |
 | `newline` | -- | Newline-delimited framing (`transport`) |
 | `tokio` | `tokio` | Async I/O helpers (`transport`) |
+| `uds` | `tokio` | `UdsClient`: batteries-included Unix-socket client (`client`) |
 | `hyper` | `hyper` | `HyperService` adapter (`server`) |
 | `tower` | `tower-service`, `http`, `http-body` | `RpcService` adapter (`server`) |
 | `http-client` | `hyper`, `hyper-util` | `HttpTransport` (`client`) |

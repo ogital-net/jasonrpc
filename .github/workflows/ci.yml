@@ -38,11 +38,11 @@ jobs:
         include:
           # serde_json backend with all integrations
           - label: serde_json
-            features: "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+            features: "server,client,transport,netstring,newline,tokio,uds,hyper,tower,http-client"
             extra_flags: ""
           # sonic-rs backend — integrations that don't require hyper
           - label: sonic
-            features: "backend-sonic,server,client,transport,netstring,newline,tokio"
+            features: "backend-sonic,server,client,transport,netstring,newline,tokio,uds"
             extra_flags: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
@@ -66,10 +66,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         include:
           - label: serde_json
-            features: "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+            features: "server,client,transport,netstring,newline,tokio,uds,hyper,tower,http-client"
             extra_flags: ""
           - label: sonic
-            features: "backend-sonic,server,client,transport,netstring,newline,tokio"
+            features: "backend-sonic,server,client,transport,netstring,newline,tokio,uds"
             extra_flags: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +132,7 @@ jobs:
       # is excluded from docs.rs because the backends are mutually exclusive.
       - run: >
           cargo doc --no-deps
-          --features "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+          --features "server,client,transport,netstring,newline,tokio,uds,hyper,tower,http-client"
 
   # ---------------------------------------------------------------------------
   msrv:

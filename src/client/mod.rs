@@ -31,6 +31,12 @@ mod multiplex;
 #[cfg(feature = "tokio")]
 pub use multiplex::{MultiplexError, MultiplexOver, MultiplexTransport};
 
+#[cfg(all(feature = "uds", unix))]
+mod uds;
+
+#[cfg(all(feature = "uds", unix))]
+pub use uds::UdsClient;
+
 /// Monotonic request-id allocator. Cheap to clone via shared reference.
 #[derive(Debug, Default)]
 pub struct IdGen {
