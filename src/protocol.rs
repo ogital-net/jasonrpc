@@ -338,7 +338,7 @@ impl std::error::Error for Error {}
 /// A request with `id == None` is a *notification*: the server must not reply.
 ///
 /// ```
-/// use jasonrpc::{Request, Id, json};
+/// use jasonrpc::{Request, Id};
 ///
 /// // Build a call (expects a response).
 /// let req = Request::call(
