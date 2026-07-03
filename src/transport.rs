@@ -7,6 +7,19 @@
 //!
 //! Framings are gated behind the `transport` feature, with `netstring` and
 //! `newline` selectable individually. Async I/O helpers require `tokio`.
+//!
+//! # Choosing a framing
+//!
+//! Both peers of a connection must use the same framing.
+//!
+//! - `Netstring` is length-prefixed and self-delimiting, so a payload may
+//!   contain any bytes and the reader never scans message content. It is the
+//!   recommended choice for program-to-program links, and the one used by the
+//!   examples.
+//! - `Newline` delimits messages with `\n`, which requires that a message
+//!   never contains a raw newline (compact JSON satisfies this). It is suited
+//!   to human-interactive control sockets and to one-shot clients that frame a
+//!   request by half-closing the connection.
 
 use crate::error::TransportError;
 
@@ -60,14 +73,15 @@ pub trait Framing {
 
 /// Newline-delimited framing: each message is followed by a single `\n`.
 ///
-/// Simple and human-friendly; requires that messages never contain a raw
-/// newline (compact JSON satisfies this). Good for interactive control sockets.
+/// Requires that messages never contain a raw newline (compact JSON satisfies
+/// this). Suited to human-interactive control sockets; for program-to-program
+/// links prefer `Netstring`, which places no constraint on payload bytes.
 ///
-/// Also tolerant of clients that half-close the write side
-/// (`shutdown(SHUT_WR)`) without a trailing newline: when EOF arrives and
-/// there is data in the buffer, it is delivered as a complete message. This
-/// means a single connection can support both multi-message `\n`-delimited
-/// sessions and one-shot clients that use the socket lifecycle as a frame.
+/// Tolerant of clients that half-close the write side (`shutdown(SHUT_WR)`)
+/// without a trailing newline: when EOF arrives and there is data in the
+/// buffer, it is delivered as a complete message. A single connection can
+/// therefore support both multi-message `\n`-delimited sessions and one-shot
+/// clients that use the socket lifecycle as a frame.
 #[cfg(feature = "newline")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Newline;
@@ -95,8 +109,10 @@ impl Framing for Newline {
 
 /// Netstring framing: `<len>:<payload>,` (see <https://cr.yp.to/proto/netstrings.txt>).
 ///
-/// Length-prefixed and self-delimiting, so payloads may contain any bytes.
-/// A good default for machine-to-machine UDS links.
+/// Length-prefixed and self-delimiting, so payloads may contain any bytes and
+/// the reader never scans message content for a delimiter. Recommended for
+/// program-to-program links, including Unix-socket and TCP peers. Compare
+/// `Newline`, which is smaller on the wire but constrains payload bytes.
 #[cfg(feature = "netstring")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Netstring;
