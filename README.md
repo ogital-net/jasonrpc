@@ -3,10 +3,11 @@
 A transport-agnostic, spec-conforming [JSON-RPC 2.0](https://www.jsonrpc.org/specification) library for Rust.
 
 ```rust
-# use jasonrpc::server::Router;
-# use jasonrpc::{Error, Request};
+# #[cfg(feature = "server")]
 # #[tokio::main]
 # async fn main() {
+# use jasonrpc::server::Router;
+# use jasonrpc::{Error, Request};
 let router = Router::new()
     .register("add", |_, req: Request| async move {
         let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
@@ -18,6 +19,8 @@ let _output = router.handle_bytes(
     br#"{"jsonrpc":"2.0","method":"add","params":[1,2],"id":1}"#
 ).await;
 # }
+# #[cfg(not(feature = "server"))]
+# fn main() {}
 ```
 
 ---
@@ -57,10 +60,11 @@ jasonrpc = { version = "0.1", features = ["server"] }
 ### Server
 
 ```rust
-# use jasonrpc::server::Router;
-# use jasonrpc::{Error, Request};
+# #[cfg(feature = "server")]
 # #[tokio::main]
 # async fn main() {
+# use jasonrpc::server::Router;
+# use jasonrpc::{Error, Request};
 let router = Router::new()
     .register("ping", |_, _req: Request| async move {
         Ok("pong")
@@ -79,6 +83,8 @@ let output = router.handle_bytes(
 // `to_bytes()` produces wire-ready output (None for all-notification batches)
 let _ = output.to_bytes();
 # }
+# #[cfg(not(feature = "server"))]
+# fn main() {}
 ```
 
 ### Client
