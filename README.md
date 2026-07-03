@@ -182,7 +182,8 @@ cargo test --test spec_conformance --features "server,tokio"
 | `client` | -- | `Client`, `Transport` trait, id correlation |
 | `transport` | -- | `Framing` trait |
 | `netstring` | -- | Netstring framing (`transport`) |
-| `newline` | -- | Newline-delimited framing (`transport`) |
+| `newline` | -- | Newline / byte-delimited framing (`transport`) |
+| `content-length` | -- | LSP/DAP `Content-Length` header framing (`transport`) |
 | `tokio` | `tokio` | Async I/O helpers (`transport`) |
 | `uds` | `tokio` | `UdsClient`: Unix-socket client (`client`) |
 | `hyper` | `hyper` | `HyperService` adapter (`server`) |

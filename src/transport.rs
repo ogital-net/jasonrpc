@@ -16,10 +16,14 @@
 //!   contain any bytes and the reader never scans message content. It is the
 //!   recommended choice for program-to-program links, and the one used by the
 //!   examples.
+//! - `ContentLength` is the `Content-Length:` header framing used by the
+//!   Language Server Protocol and the Debug Adapter Protocol. Also
+//!   length-prefixed; use it to interoperate with those ecosystems.
 //! - `Newline` delimits messages with `\n`, which requires that a message
 //!   never contains a raw newline (compact JSON satisfies this). It is suited
 //!   to human-interactive control sockets and to one-shot clients that frame a
-//!   request by half-closing the connection.
+//!   request by half-closing the connection. `Delimited` generalizes it to any
+//!   terminator byte.
 
 use crate::error::TransportError;
 
@@ -71,17 +75,80 @@ pub trait Framing {
     }
 }
 
-/// Newline-delimited framing: each message is followed by a single `\n`.
+/// Byte-delimited framing: each message is terminated by a single delimiter
+/// byte.
 ///
-/// Requires that messages never contain a raw newline (compact JSON satisfies
-/// this). Suited to human-interactive control sockets; for program-to-program
-/// links prefer `Netstring`, which places no constraint on payload bytes.
+/// Requires that messages never contain the delimiter (compact JSON never
+/// contains a raw newline or NUL, for instance). Suited to human-interactive
+/// control sockets; for program-to-program links prefer `Netstring`, which
+/// places no constraint on payload bytes.
 ///
 /// Tolerant of clients that half-close the write side (`shutdown(SHUT_WR)`)
-/// without a trailing newline: when EOF arrives and there is data in the
+/// without a trailing delimiter: when EOF arrives and there is data in the
 /// buffer, it is delivered as a complete message. A single connection can
-/// therefore support both multi-message `\n`-delimited sessions and one-shot
+/// therefore support both multi-message delimited sessions and one-shot
 /// clients that use the socket lifecycle as a frame.
+///
+/// [`Newline`] is the `\n`-delimited special case.
+///
+/// ```
+/// use jasonrpc::transport::{Delimited, Framing};
+///
+/// let f = Delimited::new(b'\0'); // NUL-delimited
+/// let mut buf = Vec::new();
+/// f.encode(b"hello", &mut buf);
+/// assert_eq!(buf, b"hello\0");
+/// let (msg, consumed) = f.decode(&buf).unwrap().unwrap();
+/// assert_eq!(msg, b"hello");
+/// assert_eq!(consumed, 6);
+/// ```
+#[cfg(feature = "newline")]
+#[derive(Clone, Copy, Debug)]
+pub struct Delimited(u8);
+
+#[cfg(feature = "newline")]
+impl Delimited {
+    /// Frame messages with `delimiter` as the terminator byte.
+    #[must_use]
+    pub const fn new(delimiter: u8) -> Self {
+        Self(delimiter)
+    }
+
+    /// The delimiter byte.
+    #[must_use]
+    pub const fn delimiter(&self) -> u8 {
+        self.0
+    }
+}
+
+#[cfg(feature = "newline")]
+impl Framing for Delimited {
+    fn encode(&self, payload: &[u8], dst: &mut Vec<u8>) {
+        dst.reserve(payload.len() + 1);
+        dst.extend_from_slice(payload);
+        dst.push(self.0);
+    }
+
+    fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+        if let Some(idx) = memchr::memchr(self.0, src) {
+            Ok(Some((src[..idx].to_vec(), idx + 1)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn take_on_eof(&self) -> bool {
+        true
+    }
+}
+
+/// Newline-delimited framing: each message is followed by a single `\n`.
+///
+/// The `\n`-delimited special case of [`Delimited`]; see it for the full
+/// contract, including tolerance of `shutdown(SHUT_WR)` one-shot clients.
+/// Requires that messages never contain a raw newline (compact JSON satisfies
+/// this). For program-to-program links prefer `Netstring`, which places no
+/// constraint on payload bytes.
 #[cfg(feature = "newline")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Newline;
@@ -89,17 +156,11 @@ pub struct Newline;
 #[cfg(feature = "newline")]
 impl Framing for Newline {
     fn encode(&self, payload: &[u8], dst: &mut Vec<u8>) {
-        dst.reserve(payload.len() + 1);
-        dst.extend_from_slice(payload);
-        dst.push(b'\n');
+        Delimited(b'\n').encode(payload, dst);
     }
 
     fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
-        if let Some(idx) = memchr::memchr(b'\n', src) {
-            Ok(Some((src[..idx].to_vec(), idx + 1)))
-        } else {
-            Ok(None)
-        }
+        Delimited(b'\n').decode(src)
     }
 
     fn take_on_eof(&self) -> bool {
@@ -167,6 +228,134 @@ impl Framing for Netstring {
     fn take_on_eof(&self) -> bool {
         false
     }
+}
+
+/// `Content-Length` header framing, as used by the Language Server Protocol
+/// and the Debug Adapter Protocol.
+///
+/// Each message is prefixed by one or more `Key: Value` headers terminated by a
+/// blank line, then the payload:
+///
+/// ```text
+/// Content-Length: 42\r\n
+/// \r\n
+/// {"jsonrpc":"2.0", ... }
+/// ```
+///
+/// A `Content-Length` header giving the payload byte count is required. Any
+/// other headers (such as the optional `Content-Type`) are accepted and
+/// ignored. Being length-prefixed, the payload may contain any bytes.
+///
+/// Encoding emits `Content-Length: <n>\r\n\r\n` followed by the payload.
+///
+/// ```
+/// use jasonrpc::transport::{ContentLength, Framing};
+///
+/// let f = ContentLength;
+/// let mut buf = Vec::new();
+/// f.encode(b"{}", &mut buf);
+/// assert_eq!(buf, b"Content-Length: 2\r\n\r\n{}");
+///
+/// let (msg, consumed) = f.decode(&buf).unwrap().unwrap();
+/// assert_eq!(msg, b"{}");
+/// assert_eq!(consumed, buf.len());
+/// ```
+#[cfg(feature = "content-length")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContentLength;
+
+#[cfg(feature = "content-length")]
+impl ContentLength {
+    /// Cap on the header block size, guarding against a peer that streams
+    /// header bytes without ever sending the terminating blank line.
+    const MAX_HEADER_BYTES: usize = 8 * 1024;
+}
+
+#[cfg(feature = "content-length")]
+impl Framing for ContentLength {
+    fn encode(&self, payload: &[u8], dst: &mut Vec<u8>) {
+        let mut itoa_buf = itoa::Buffer::new();
+        let len = itoa_buf.format(payload.len());
+        // "Content-Length: " + len + "\r\n\r\n" + payload
+        dst.reserve(16 + len.len() + 4 + payload.len());
+        dst.extend_from_slice(b"Content-Length: ");
+        dst.extend_from_slice(len.as_bytes());
+        dst.extend_from_slice(b"\r\n\r\n");
+        dst.extend_from_slice(payload);
+    }
+
+    fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+        // Locate the end of the header block: a blank line (`\r\n\r\n`).
+        let Some(sep) = find_header_end(src) else {
+            if src.len() > Self::MAX_HEADER_BYTES {
+                return Err(TransportError::Frame(
+                    "content-length header block too long".into(),
+                ));
+            }
+            return Ok(None); // headers still arriving
+        };
+        let header_end = sep + 4; // past the blank-line separator
+        let headers = &src[..sep];
+
+        // Scan headers for Content-Length (case-insensitive name).
+        let mut content_len: Option<usize> = None;
+        for line in split_crlf(headers) {
+            let Some(colon) = memchr::memchr(b':', line) else {
+                return Err(TransportError::Frame(
+                    "malformed content-length header line".into(),
+                ));
+            };
+            let (name, value) = (&line[..colon], &line[colon + 1..]);
+            if name.eq_ignore_ascii_case(b"content-length") {
+                let value = std::str::from_utf8(value).map(str::trim).ok();
+                let parsed = value
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .ok_or_else(|| TransportError::Frame("invalid content-length value".into()))?;
+                content_len = Some(parsed);
+            }
+            // Other headers (e.g. Content-Type) are ignored.
+        }
+
+        let len = content_len
+            .ok_or_else(|| TransportError::Frame("missing content-length header".into()))?;
+
+        // Guard against overflow on 32-bit targets before comparing.
+        let end = header_end
+            .checked_add(len)
+            .ok_or_else(|| TransportError::Frame("content-length overflows usize".into()))?;
+        if src.len() < end {
+            return Ok(None); // payload still arriving
+        }
+
+        Ok(Some((src[header_end..end].to_vec(), end)))
+    }
+
+    fn take_on_eof(&self) -> bool {
+        false
+    }
+}
+
+/// Find the byte offset of the `\r\n\r\n` header/body separator, if present.
+#[cfg(feature = "content-length")]
+fn find_header_end(src: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = memchr::memchr(b'\r', &src[from..]) {
+        let i = from + rel;
+        if src[i..].starts_with(b"\r\n\r\n") {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// Iterate over CRLF-separated header lines, skipping empty lines.
+#[cfg(feature = "content-length")]
+fn split_crlf(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
+    headers
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
 }
 
 /// Tokio-based async I/O driver over a [`Framing`] codec.
@@ -493,6 +682,94 @@ mod netstring_tests {
     }
 }
 
+#[cfg(all(test, feature = "content-length"))]
+mod content_length_tests {
+    use super::*;
+
+    #[test]
+    fn round_trip() {
+        let f = ContentLength;
+        let mut buf = Vec::new();
+        f.encode(b"{\"a\":1}", &mut buf);
+        assert_eq!(buf, b"Content-Length: 7\r\n\r\n{\"a\":1}");
+        let (msg, consumed) = f.decode(&buf).unwrap().unwrap();
+        assert_eq!(msg, b"{\"a\":1}");
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn partial_header_and_body_return_none() {
+        let f = ContentLength;
+        // Headers not yet complete.
+        assert!(f.decode(b"Content-Length: 5\r\n").unwrap().is_none());
+        // Headers complete, body still arriving.
+        assert!(f.decode(b"Content-Length: 5\r\n\r\nab").unwrap().is_none());
+    }
+
+    #[test]
+    fn ignores_extra_headers_case_insensitively() {
+        let f = ContentLength;
+        let frame = b"Content-Type: application/vscode-jsonrpc\r\ncontent-length: 2\r\n\r\n{}";
+        let (msg, consumed) = f.decode(frame).unwrap().unwrap();
+        assert_eq!(msg, b"{}");
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn two_frames_decode_independently() {
+        let f = ContentLength;
+        let mut buf = Vec::new();
+        f.encode(b"{}", &mut buf);
+        f.encode(b"[]", &mut buf);
+        let (m1, c1) = f.decode(&buf).unwrap().unwrap();
+        assert_eq!(m1, b"{}");
+        let (m2, c2) = f.decode(&buf[c1..]).unwrap().unwrap();
+        assert_eq!(m2, b"[]");
+        assert_eq!(c1 + c2, buf.len());
+    }
+
+    #[test]
+    fn missing_length_errors() {
+        let f = ContentLength;
+        let err = f.decode(b"X-Foo: bar\r\n\r\n{}").unwrap_err();
+        assert!(
+            matches!(err, TransportError::Frame(ref m) if m.contains("missing content-length"))
+        );
+    }
+
+    #[test]
+    fn invalid_length_errors() {
+        let f = ContentLength;
+        let err = f
+            .decode(b"Content-Length: notanumber\r\n\r\n{}")
+            .unwrap_err();
+        assert!(
+            matches!(err, TransportError::Frame(ref m) if m.contains("invalid content-length"))
+        );
+    }
+
+    #[test]
+    fn malformed_header_line_errors() {
+        let f = ContentLength;
+        let err = f.decode(b"NoColonHere\r\n\r\n{}").unwrap_err();
+        assert!(matches!(err, TransportError::Frame(ref m) if m.contains("malformed")));
+    }
+
+    #[test]
+    fn oversized_header_block_errors() {
+        let f = ContentLength;
+        // A long run of header bytes with no terminating blank line.
+        let junk = vec![b'x'; ContentLength::MAX_HEADER_BYTES + 1];
+        let err = f.decode(&junk).unwrap_err();
+        assert!(matches!(err, TransportError::Frame(ref m) if m.contains("header block too long")));
+    }
+
+    #[test]
+    fn take_on_eof_is_false() {
+        assert!(!ContentLength.take_on_eof());
+    }
+}
+
 #[cfg(all(test, feature = "newline"))]
 mod newline_tests {
     use super::*;
@@ -525,6 +802,29 @@ mod newline_tests {
     #[test]
     fn take_on_eof_is_true() {
         assert!(Newline.take_on_eof());
+    }
+
+    #[test]
+    fn delimited_custom_byte_round_trip() {
+        let f = Delimited::new(b'\0');
+        assert_eq!(f.delimiter(), b'\0');
+        let mut buf = Vec::new();
+        f.encode(b"hello", &mut buf);
+        assert_eq!(buf, b"hello\0");
+        let (msg, consumed) = f.decode(&buf).unwrap().unwrap();
+        assert_eq!(msg, b"hello");
+        assert_eq!(consumed, 6);
+        // A different delimiter is not found in the same buffer.
+        assert!(Delimited::new(b'|').decode(b"hello").unwrap().is_none());
+    }
+
+    #[test]
+    fn newline_matches_delimited_newline() {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        Newline.encode(b"x", &mut a);
+        Delimited::new(b'\n').encode(b"x", &mut b);
+        assert_eq!(a, b);
     }
 }
 

@@ -43,6 +43,9 @@ http-client = [
 # Individual framings (only meaningful with `transport`).
 netstring = ["transport", "dep:itoa"]
 newline = ["transport", "dep:memchr"]
+# `Content-Length:` header framing, as used by LSP and the Debug Adapter
+# Protocol. Length-prefixed and content-agnostic.
+content-length = ["transport", "dep:memchr", "dep:itoa"]
 
 # Async I/O helpers for the transport layer.
 tokio = ["transport", "dep:tokio"]
@@ -108,5 +111,5 @@ name = "gateway_demo"
 required-features = ["server", "http-client", "hyper", "netstring", "tokio"]
 
 [package.metadata.docs.rs]
-features = ["server", "client", "transport", "netstring", "newline", "tokio", "uds", "hyper", "tower", "http-client"]
+features = ["server", "client", "transport", "netstring", "newline", "content-length", "tokio", "uds", "hyper", "tower", "http-client"]
 rustdoc-args = ["--cfg", "docsrs"]
