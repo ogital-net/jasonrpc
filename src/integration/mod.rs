@@ -13,3 +13,6 @@ pub mod hyper;
 
 #[cfg(feature = "tower")]
 pub mod tower;
+
+#[cfg(feature = "websocket")]
+pub mod websocket;

@@ -62,6 +62,13 @@ hyper = ["server", "dep:hyper", "dep:http", "dep:http-body-util", "dep:bytes"]
 # into an axum/tower stack without dragging in the whole `tower` crate.
 tower = ["server", "dep:tower-service", "dep:http", "dep:http-body", "dep:http-body-util", "dep:bytes"]
 
+# WebSocket integration. `WsService` drives a `Router` over a WebSocket
+# connection: each text message is one JSON-RPC message. Built on
+# `fastwebsockets`, whose `upgrade` path reuses the `hyper` stack this crate
+# already depends on, so it adds little beyond the unavoidable RFC6455 bits
+# (sha1/base64 handshake, utf-8 validation).
+websocket = ["server", "tokio", "dep:fastwebsockets", "dep:http-body-util", "dep:bytes"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 
@@ -86,6 +93,10 @@ bytes = { version = "1", optional = true }
 
 # Tower integration (optional). Kept minimal: just the service + http traits.
 tower-service = { version = "0.3", optional = true }
+
+# WebSocket integration (optional). `upgrade` reuses hyper for the HTTP upgrade
+# handshake; `simd` enables SIMD frame masking/unmasking.
+fastwebsockets = { version = "0.10", optional = true, features = ["upgrade", "simd"] }
 # HTTP types used by RequestContext — pulled in by hyper or tower features.
 # Lightweight (just bytes + itoa, both already transitive), but kept optional
 # so protocol+json users don't pay for it.
@@ -112,6 +123,10 @@ required-features = ["server", "client", "uds", "netstring", "tokio"]
 name = "gateway_demo"
 required-features = ["server", "http-client", "hyper", "uds", "netstring", "tokio"]
 
+[[example]]
+name = "ws_controller"
+required-features = ["server", "websocket", "tokio", "hyper"]
+
 # Dispatch/serialization microbenchmarks. Compiles under whichever JSON backend
 # is selected, so the same bench runs against both for a head-to-head compare
 # (see the header comment in benches/dispatch.rs).
@@ -124,5 +139,5 @@ name = "dispatch"
 harness = false
 
 [package.metadata.docs.rs]
-features = ["server", "client", "transport", "netstring", "newline", "content-length", "tokio", "uds", "hyper", "tower", "http-client"]
+features = ["server", "client", "transport", "netstring", "newline", "content-length", "tokio", "uds", "hyper", "tower", "websocket", "http-client"]
 rustdoc-args = ["--cfg", "docsrs"]

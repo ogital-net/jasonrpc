@@ -17,7 +17,7 @@ pub mod client;
 #[cfg(feature = "transport")]
 pub mod transport;
 
-#[cfg(any(feature = "hyper", feature = "tower"))]
+#[cfg(any(feature = "hyper", feature = "tower", feature = "websocket"))]
 pub mod integration;
 
 // Convenient top-level re-exports of the always-on protocol types.

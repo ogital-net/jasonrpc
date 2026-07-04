@@ -46,7 +46,7 @@ The crate is organized so each layer is usable independently:
 | `server` | `server` | `Router` for method registration and dispatch (single + batch) |
 | `client` | `client` | `Client` with typed call/notify, id correlation, and raw passthrough |
 | `transport` | `transport` | Framing codecs (`netstring`, `newline`) and async I/O |
-| `integration` | `hyper`, `tower` | Adapters: `HyperService`, `RpcService` (axum-ready) |
+| `integration` | `hyper`, `tower`, `websocket` | Adapters: `HyperService`, `RpcService` (axum-ready), WebSocket `serve` |
 
 ## Quick start
 
@@ -157,6 +157,9 @@ cargo run --example uds_demo --features "server,client,netstring,tokio"
 
 # HTTP front door -> multiplexed UDS upstream, with id rewriting
 cargo run --example gateway_demo --features "server,http-client,hyper,netstring,tokio"
+
+# JSON-RPC over WebSocket: a server dispatching messages from WS clients
+cargo run --example ws_controller --features "server,websocket,tokio,hyper"
 ```
 
 ## Benchmarks
@@ -217,6 +220,7 @@ cargo test --test spec_conformance --features "server,tokio"
 | `uds` | `tokio` | `UdsClient`: Unix-socket client (`client`) |
 | `hyper` | `hyper` | `HyperService` adapter (`server`) |
 | `tower` | `tower-service`, `http`, `http-body` | `RpcService` adapter (`server`) |
+| `websocket` | `fastwebsockets` | WebSocket `serve` adapter, reuses hyper (`server`) |
 | `http-client` | `hyper`, `hyper-util` | `HttpTransport` (`client`) |
 
 ## License
