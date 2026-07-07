@@ -66,8 +66,9 @@ tower = ["server", "dep:tower-service", "dep:http", "dep:http-body", "dep:http-b
 # connection: each text message is one JSON-RPC message. Built on
 # `fastwebsockets`, whose `upgrade` path reuses the `hyper` stack this crate
 # already depends on, so it adds little beyond the unavoidable RFC6455 bits
-# (sha1/base64 handshake, utf-8 validation).
-websocket = ["server", "tokio", "dep:fastwebsockets", "dep:http-body-util", "dep:bytes"]
+# (sha1/base64 handshake, utf-8 validation). `tokio/macros` is needed for the
+# `select!` in the graceful-shutdown serve loop.
+websocket = ["server", "tokio", "tokio/macros", "dep:fastwebsockets", "dep:http-body-util", "dep:bytes"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -25,7 +25,7 @@
 //! server-side HTTP upgrade using the `hyper` stack this crate already depends
 //! on.
 
-use fastwebsockets::{Frame, OpCode, Payload, WebSocket, WebSocketError};
+use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, WebSocket, WebSocketError};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::server::{RequestContext, Router};
@@ -80,6 +80,20 @@ impl From<WebSocketError> for WsError {
 /// The `socket` is typically obtained from [`upgrade`] on the server side. Auto
 /// ping/pong and close handling are enabled on the passed socket.
 ///
+/// Fragmented messages are reassembled before dispatch, so a handler always
+/// sees one complete JSON-RPC message even if the peer split it across several
+/// WebSocket frames.
+///
+/// # Message size limit
+///
+/// `fastwebsockets` enforces a maximum message size (default 64 MiB) and closes
+/// the connection with an error if a peer exceeds it, which bounds per-message
+/// memory. To pick your own limit, call
+/// [`WebSocket::set_max_message_size`](fastwebsockets::WebSocket::set_max_message_size)
+/// on the socket before passing it here. Note the cap applies per *frame*; a
+/// peer sending many fragments of a single message can still accumulate beyond
+/// it, so set a limit appropriate to your workload for untrusted peers.
+///
 /// # Errors
 ///
 /// Returns a [`WsError`] if the WebSocket connection fails. A clean close
@@ -118,6 +132,12 @@ where
     socket.set_auto_close(true);
     socket.set_auto_pong(true);
 
+    // Wrap in a `FragmentCollector` so a message split across several frames
+    // (fin=false plus `Continuation` frames) is reassembled into one payload
+    // before dispatch. `WebSocket::read_frame` alone yields raw frames and
+    // would hand a partial message to the router.
+    let mut socket = FragmentCollector::new(socket);
+
     loop {
         // `read_frame` handles obligated sends (auto-pong / auto-close) itself.
         let frame = match socket.read_frame().await {
@@ -146,7 +166,8 @@ where
                         .await?;
                 }
             }
-            // Ping / Pong / Continuation are handled by the library.
+            // Ping / Pong are handled by the library; Continuation frames are
+            // consumed by the `FragmentCollector` and never surface here.
             _ => {}
         }
     }
@@ -227,6 +248,9 @@ where
 {
     socket.set_auto_close(true);
     socket.set_auto_pong(true);
+
+    // Reassemble fragmented messages before dispatch. See `serve_with_context`.
+    let mut socket = FragmentCollector::new(socket);
 
     // Pin the shutdown future so it holds state across loop iterations: each
     // `select!` re-polls the *same* future rather than restarting it.
@@ -368,6 +392,59 @@ mod tests {
         let s = String::from_utf8(reply.payload.to_vec()).unwrap();
         assert!(s.contains("-32601"), "{s}");
         assert!(s.contains("\"id\":\"x\""), "{s}");
+
+        client.write_frame(Frame::close(1000, b"")).await.unwrap();
+        let _ = server.await.unwrap();
+    }
+
+    /// A single JSON-RPC message split across multiple WebSocket frames
+    /// (an initial non-final Text frame plus `Continuation` frames) is
+    /// reassembled and dispatched as one request.
+    #[tokio::test]
+    async fn reassembles_fragmented_message() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let ws = WebSocket::after_handshake(server_io, Role::Server);
+            serve(ws, &router()).await
+        });
+
+        let mut client = WebSocket::after_handshake(client_io, Role::Client);
+
+        // Split a valid request into three byte-chunks sent as fragments.
+        let full = br#"{"jsonrpc":"2.0","method":"add","params":[40,2],"id":7}"#;
+        let (a, rest) = full.split_at(20);
+        let (b, c) = rest.split_at(20);
+
+        // First frame: Text, fin=false. Middle: Continuation, fin=false.
+        // Last: Continuation, fin=true.
+        client
+            .write_frame(Frame::new(false, OpCode::Text, None, Payload::Borrowed(a)))
+            .await
+            .unwrap();
+        client
+            .write_frame(Frame::new(
+                false,
+                OpCode::Continuation,
+                None,
+                Payload::Borrowed(b),
+            ))
+            .await
+            .unwrap();
+        client
+            .write_frame(Frame::new(
+                true,
+                OpCode::Continuation,
+                None,
+                Payload::Borrowed(c),
+            ))
+            .await
+            .unwrap();
+
+        let reply = client.read_frame().await.unwrap();
+        assert_eq!(reply.opcode, OpCode::Text);
+        let s = String::from_utf8(reply.payload.to_vec()).unwrap();
+        assert!(s.contains("\"result\":42"), "{s}");
+        assert!(s.contains("\"id\":7"), "{s}");
 
         client.write_frame(Frame::close(1000, b"")).await.unwrap();
         let _ = server.await.unwrap();
