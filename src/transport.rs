@@ -359,6 +359,48 @@ fn split_crlf(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// Tokio-based async I/O driver over a [`Framing`] codec.
+///
+/// # Graceful shutdown
+///
+/// This crate is sans-I/O: for raw transports (UDS, TCP) *you* own the accept
+/// loop, so graceful shutdown is a standard tokio pattern rather than a library
+/// feature. Race `accept` against a shutdown signal, then wait for the spawned
+/// per-connection tasks to drain. Any `Future` works as the signal — a
+/// [`tokio::sync::oneshot`] receiver, a `broadcast`/`watch` receiver, or
+/// `tokio_util`'s `CancellationToken` — so no extra dependency is required.
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use tokio::net::UnixListener;
+/// use tokio::task::JoinSet;
+/// # use jasonrpc::server::Router;
+/// # async fn serve_conn(_r: Router<()>, _s: tokio::net::UnixStream) {}
+///
+/// # async fn run(listener: UnixListener, router: Router<()>, stop: tokio::sync::oneshot::Receiver<()>) {
+/// // Any future works as the shutdown signal — a oneshot here, but a
+/// // broadcast/watch receiver or `tokio::signal::ctrl_c()` works the same way.
+/// let shutdown = async { let _ = stop.await; };
+/// tokio::pin!(shutdown);
+///
+/// let mut conns = JoinSet::new();
+/// loop {
+///     tokio::select! {
+///         accepted = listener.accept() => {
+///             if let Ok((stream, _)) = accepted {
+///                 conns.spawn(serve_conn(router.clone(), stream));
+///             }
+///         }
+///         () = &mut shutdown => break, // stop accepting new connections
+///     }
+/// }
+///
+/// // Drain: let in-flight connections finish their current work.
+/// while conns.join_next().await.is_some() {}
+/// # }
+/// ```
+///
+/// To bound the drain, wrap the final loop in [`tokio::time::timeout`] and
+/// `conns.abort_all()` if it elapses.
 #[cfg(feature = "tokio")]
 pub mod io {
     use std::time::Duration;

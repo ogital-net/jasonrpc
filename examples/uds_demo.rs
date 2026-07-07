@@ -15,6 +15,8 @@
 //!   call and multiplexes calls over a single connection
 //! - `Router` dispatch (by `method`, identical to the HTTP integrations)
 //! - `Client::with_request_timeout` for call-level deadline enforcement
+//! - graceful shutdown: the accept loop selects on a shutdown signal and drains
+//!   in-flight connections via a `JoinSet` instead of aborting mid-request
 
 #![allow(clippy::ignored_unit_patterns)]
 
@@ -97,12 +99,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = UnixListener::bind(&sock)?;
     let router = build_router();
 
+    // A shutdown signal for the accept loop. This example fires it manually at
+    // the end; a real server would wire it to `tokio::signal::ctrl_c()` or a
+    // SIGTERM handler. Any `Future` works here — oneshot, broadcast/watch, or
+    // `tokio_util`'s `CancellationToken` — so no extra dependency is needed.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Accept loop in the background. Each connection gets a cheap clone of the
-    // router (shared method table behind an `Arc`).
+    // router (shared method table behind an `Arc`) and is tracked in a
+    // `JoinSet` so shutdown can drain in-flight connections.
     let accept = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(serve_conn(router.clone(), stream));
+        let mut conns = tokio::task::JoinSet::new();
+        tokio::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((stream, _)) = accepted {
+                        conns.spawn(serve_conn(router.clone(), stream));
+                    }
+                }
+                // Stop accepting new connections once shutdown fires.
+                _ = &mut shutdown_rx => break,
+            }
         }
+        // Drain: let already-accepted connections finish their current work.
+        while conns.join_next().await.is_some() {}
     });
 
     // Drive it with the client. A 5-second timeout per call ensures the demo
@@ -144,7 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     println!("sent notification (no response expected)");
 
-    accept.abort();
+    // Graceful shutdown: signal the accept loop to stop taking new connections
+    // and let it drain the ones still open, instead of aborting mid-request.
+    let _ = shutdown_tx.send(());
+    let _ = accept.await;
     let _ = std::fs::remove_file(&sock);
     Ok(())
 }

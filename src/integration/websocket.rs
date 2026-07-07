@@ -152,6 +152,131 @@ where
     }
 }
 
+/// Like [`serve`], but stops cleanly when `shutdown` resolves.
+///
+/// This is the graceful-shutdown entry point. It drives the [`Router`] exactly
+/// like [`serve`], but races each read against the `shutdown` future. When
+/// `shutdown` resolves first, the loop stops accepting new messages, sends a
+/// WebSocket Close frame (normal-closure `1000`) to the peer, and returns
+/// `Ok(())`. A response already being written is allowed to finish first, so no
+/// reply is truncated mid-flight.
+///
+/// `shutdown` is any `Future`, so it composes with whatever signal the
+/// application already uses — a [`tokio::sync::oneshot`] receiver, a
+/// `broadcast` receiver, `tokio_util`'s `CancellationToken::cancelled`, or a
+/// timer. No extra dependency is required.
+///
+/// # Cancellation safety
+///
+/// `shutdown` is polled inside a [`tokio::select!`] and may be dropped without
+/// completing if the peer closes first. Pass a future that tolerates being
+/// dropped (all of the primitives named above do).
+///
+/// # Errors
+///
+/// Returns a [`WsError`] if the WebSocket connection fails. A clean close —
+/// whether initiated by the peer or by `shutdown` — returns `Ok(())`.
+///
+/// ```no_run
+/// use jasonrpc::integration::websocket::{self, upgrade};
+/// use jasonrpc::server::Router;
+/// use tokio::sync::watch;
+///
+/// # async fn run<S>(socket: fastwebsockets::WebSocket<S>, router: Router<()>, mut shutdown_rx: watch::Receiver<bool>)
+/// # where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+/// // Resolve when the shared flag flips to `true`.
+/// let shutdown = async move { let _ = shutdown_rx.wait_for(|stop| *stop).await; };
+/// websocket::serve_with_shutdown(socket, &router, shutdown).await.unwrap();
+/// # }
+/// ```
+pub async fn serve_with_shutdown<S, State, Fut>(
+    socket: WebSocket<S>,
+    router: &Router<State>,
+    shutdown: Fut,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    State: Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    serve_with_context_shutdown(socket, router, &RequestContext::default, shutdown).await
+}
+
+/// Like [`serve_with_context`], but stops cleanly when `shutdown` resolves.
+///
+/// Combines the per-message [`RequestContext`] construction of
+/// [`serve_with_context`] with the graceful-shutdown behavior of
+/// [`serve_with_shutdown`]. See those functions for details on `make_ctx` and
+/// `shutdown` respectively.
+///
+/// # Errors
+///
+/// Returns a [`WsError`] if the WebSocket connection fails. A clean close —
+/// whether initiated by the peer or by `shutdown` — returns `Ok(())`.
+pub async fn serve_with_context_shutdown<S, State, F, Fut>(
+    mut socket: WebSocket<S>,
+    router: &Router<State>,
+    make_ctx: &F,
+    shutdown: Fut,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    State: Clone + Send + Sync + 'static,
+    F: Fn() -> RequestContext,
+    Fut: std::future::Future<Output = ()>,
+{
+    socket.set_auto_close(true);
+    socket.set_auto_pong(true);
+
+    // Pin the shutdown future so it holds state across loop iterations: each
+    // `select!` re-polls the *same* future rather than restarting it.
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        let frame = tokio::select! {
+            biased;
+            // Prefer draining a ready frame over an equally-ready shutdown,
+            // so an already-arrived request is still answered.
+            frame = socket.read_frame() => frame,
+            () = shutdown.as_mut() => {
+                // Send a normal-closure Close frame and stop. Ignore the
+                // write result: the peer may already be gone.
+                let _ = socket
+                    .write_frame(Frame::close(1000, b"server shutting down"))
+                    .await;
+                return Ok(());
+            }
+        };
+
+        // `read_frame` handles obligated sends (auto-pong / auto-close) itself.
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(WebSocketError::ConnectionClosed) => return Ok(()),
+            Err(e) => return Err(WsError::WebSocket(e)),
+        };
+
+        match frame.opcode {
+            OpCode::Close => return Ok(()),
+            OpCode::Text | OpCode::Binary => {
+                let output = router
+                    .handle_bytes_with_context(&frame.payload, make_ctx())
+                    .await;
+                let reply_bytes = match output.to_bytes() {
+                    Ok(Some(bytes)) => Some(bytes),
+                    Ok(None) => None,
+                    Err(_) => Some(internal_error_body()),
+                };
+                if let Some(bytes) = reply_bytes {
+                    socket
+                        .write_frame(Frame::text(Payload::Owned(bytes)))
+                        .await?;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A JSON body for a top-level internal error (`-32603`) with a `Null` id.
 fn internal_error_body() -> Vec<u8> {
     let err = crate::protocol::Response::error(
@@ -246,5 +371,67 @@ mod tests {
 
         client.write_frame(Frame::close(1000, b"")).await.unwrap();
         let _ = server.await.unwrap();
+    }
+
+    /// `serve_with_shutdown` returns `Ok(())` and sends a Close frame when the
+    /// shutdown signal fires, even with no peer activity.
+    #[tokio::test]
+    async fn shutdown_signal_closes_cleanly() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let ws = WebSocket::after_handshake(server_io, Role::Server);
+            let shutdown = async move {
+                let _ = rx.await;
+            };
+            serve_with_shutdown(ws, &router(), shutdown).await
+        });
+
+        let mut client = WebSocket::after_handshake(client_io, Role::Client);
+        // Don't auto-echo the Close: the server socket is already gone by then.
+        client.set_auto_close(false);
+
+        // Trigger shutdown; the server should close on its own.
+        tx.send(()).unwrap();
+
+        let frame = client.read_frame().await.unwrap();
+        assert_eq!(frame.opcode, OpCode::Close);
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    /// A request already on the wire when shutdown fires is still answered
+    /// (biased select drains readable frames before honoring shutdown).
+    #[tokio::test]
+    async fn shutdown_still_answers_pending_request() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let ws = WebSocket::after_handshake(server_io, Role::Server);
+            let shutdown = async move {
+                let _ = rx.await;
+            };
+            serve_with_shutdown(ws, &router(), shutdown).await
+        });
+
+        let mut client = WebSocket::after_handshake(client_io, Role::Client);
+        client.set_auto_close(false);
+        let call = br#"{"jsonrpc":"2.0","method":"add","params":[40,2],"id":1}"#;
+        client
+            .write_frame(Frame::text(Payload::Borrowed(call)))
+            .await
+            .unwrap();
+
+        let reply = client.read_frame().await.unwrap();
+        assert_eq!(reply.opcode, OpCode::Text);
+        let s = String::from_utf8(reply.payload.to_vec()).unwrap();
+        assert!(s.contains("\"result\":42"), "{s}");
+
+        // Now shut down; expect a Close frame next.
+        tx.send(()).unwrap();
+        let frame = client.read_frame().await.unwrap();
+        assert_eq!(frame.opcode, OpCode::Close);
+        assert!(server.await.unwrap().is_ok());
     }
 }
