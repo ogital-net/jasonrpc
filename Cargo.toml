@@ -62,7 +62,7 @@ hyper = ["server", "dep:hyper", "dep:http", "dep:http-body-util", "dep:bytes"]
 # into an axum/tower stack without dragging in the whole `tower` crate.
 tower = ["server", "dep:tower-service", "dep:http", "dep:http-body", "dep:http-body-util", "dep:bytes"]
 
-# WebSocket integration. `WsService` drives a `Router` over a WebSocket
+# WebSocket integration. `serve` drives a `Router` over a WebSocket
 # connection: each text message is one JSON-RPC message. Built on
 # `fastwebsockets`, whose `upgrade` path reuses the `hyper` stack this crate
 # already depends on, so it adds little beyond the unavoidable RFC6455 bits
