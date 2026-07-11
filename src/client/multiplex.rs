@@ -25,6 +25,7 @@
 //! returns without registering a waiter.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
@@ -127,11 +128,18 @@ impl Drop for PendingGuard<'_> {
 pub struct MultiplexTransport<W, F> {
     writer: Arc<AsyncMutex<FramedWriter<W, F>>>,
     pending: Pending,
+    /// `true` while the background reader is alive. Flipped to `false` when the
+    /// reader loop exits (EOF or error), so callers can detect a dead
+    /// connection and fail fast instead of writing into a socket whose replies
+    /// will never be read.
+    connected: Arc<AtomicBool>,
 }
 
 impl<W, F> std::fmt::Debug for MultiplexTransport<W, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MultiplexTransport").finish()
+        f.debug_struct("MultiplexTransport")
+            .field("connected", &self.connected.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -140,6 +148,7 @@ impl<W, F> Clone for MultiplexTransport<W, F> {
         Self {
             writer: Arc::clone(&self.writer),
             pending: Arc::clone(&self.pending),
+            connected: Arc::clone(&self.connected),
         }
     }
 }
@@ -163,6 +172,7 @@ where
     pub fn new(stream: S, framing: F) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
 
         let writer = Arc::new(AsyncMutex::new(FramedWriter::new(
             write_half,
@@ -171,16 +181,27 @@ where
 
         // Spawn the reader task: decode frames, route by id.
         let reader = FramedReader::new(read_half, framing);
-        tokio::spawn(reader_loop(reader, Arc::clone(&pending)));
+        tokio::spawn(reader_loop(
+            reader,
+            Arc::clone(&pending),
+            Arc::clone(&connected),
+        ));
 
-        MultiplexTransport { writer, pending }
+        MultiplexTransport {
+            writer,
+            pending,
+            connected,
+        }
     }
 }
 
 /// The background reader: pull frames, parse ids, deliver to waiters. On any
 /// end-of-stream or error, drop all waiters (their receivers resolve to Err).
-async fn reader_loop<R, F>(mut reader: FramedReader<R, F>, pending: Pending)
-where
+async fn reader_loop<R, F>(
+    mut reader: FramedReader<R, F>,
+    pending: Pending,
+    connected: Arc<AtomicBool>,
+) where
     R: AsyncRead + Unpin,
     F: Framing,
 {
@@ -198,7 +219,9 @@ where
             // that we can't attribute) is dropped; the affected caller will
             // time out or fail when the connection ends.
         } else {
-            // Clean EOF or error: fail everyone still waiting.
+            // Clean EOF or error: mark the connection dead so future calls fail
+            // fast, then fail everyone still waiting.
+            connected.store(false, Ordering::Release);
             pending.lock().unwrap().clear();
             return;
         }
@@ -222,6 +245,12 @@ where
     type Error = MultiplexError;
 
     async fn round_trip(&self, request: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
+        // If the reader has already exited, no reply can ever arrive; fail now
+        // rather than writing into a dead socket and hanging on the oneshot.
+        if !self.is_connected() {
+            return Err(MultiplexError::ConnectionClosed);
+        }
+
         // The id must be recoverable from the request so we can correlate the
         // reply. `Client` always includes one for calls.
         let id = parse_id(&request).ok_or(MultiplexError::MissingId)?;
@@ -246,6 +275,9 @@ where
     }
 
     async fn send_notification(&self, notification: Vec<u8>) -> Result<(), Self::Error> {
+        if !self.is_connected() {
+            return Err(MultiplexError::ConnectionClosed);
+        }
         // No id, no waiter -- just write it.
         self.write_frame(&notification).await
     }
@@ -259,6 +291,14 @@ where
     async fn write_frame(&self, frame: &[u8]) -> Result<(), MultiplexError> {
         let mut writer = self.writer.lock().await;
         writer.send(frame).await.map_err(MultiplexError::from)
+    }
+
+    /// Whether the background reader is still alive. Returns `false` once the
+    /// connection has closed or errored, after which every call fails with
+    /// [`MultiplexError::ConnectionClosed`].
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
     }
 
     /// The number of in-flight calls currently registered in the pending map.

@@ -35,7 +35,7 @@ pub use multiplex::{MultiplexError, MultiplexOver, MultiplexTransport};
 mod uds;
 
 #[cfg(all(feature = "uds", unix))]
-pub use uds::UdsClient;
+pub use uds::{ReconnectingUds, RetryPolicy, UdsClient};
 
 /// Monotonic request-id allocator. Cheap to clone via shared reference.
 #[derive(Debug, Default)]
