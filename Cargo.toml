@@ -117,6 +117,10 @@ name = "hyper_demo"
 required-features = ["hyper", "http-client"]
 
 [[example]]
+name = "oauth_client_credentials"
+required-features = ["hyper", "http-client", "tokio"]
+
+[[example]]
 name = "uds_demo"
 required-features = ["server", "client", "uds", "netstring", "tokio"]
 

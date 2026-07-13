@@ -23,7 +23,9 @@ use crate::protocol::{Id, Request, Response};
 mod http;
 
 #[cfg(feature = "http-client")]
-pub use http::{HttpTransport, HttpTransportError, DEFAULT_MAX_RESPONSE_SIZE};
+pub use http::{
+    AuthError, Authorizer, HttpTransport, HttpTransportError, NoAuth, DEFAULT_MAX_RESPONSE_SIZE,
+};
 
 #[cfg(feature = "tokio")]
 mod multiplex;
