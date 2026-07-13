@@ -211,7 +211,7 @@ where
 ///
 /// If the connection drops (for example, the server restarts), the client
 /// re-dials the socket on the next call according to its [`RetryPolicy`]. See
-/// the [module docs](self) for the exact recovery semantics.
+/// [`ReconnectingUds`] for the exact recovery semantics.
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {

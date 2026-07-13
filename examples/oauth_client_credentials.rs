@@ -236,8 +236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let issued = Arc::new(AtomicU64::new(0));
     let token_url = spawn_token_server(Arc::clone(&issued)).await;
 
-    let router =
-        Router::new().register("whoami", |_, _req: Request| async move { Ok("authenticated") });
+    let router = Router::new().register(
+        "whoami",
+        |_, _req: Request| async move { Ok("authenticated") },
+    );
     let api_url = spawn_api_server(router).await;
 
     // The client: HTTP transport + client-credentials authorizer.
