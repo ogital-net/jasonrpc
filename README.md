@@ -54,7 +54,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-jasonrpc = { version = "0.4", features = ["server"] }
+jasonrpc = { version = "0.5", features = ["server"] }
 ```
 
 ### Server
@@ -138,10 +138,10 @@ Exactly one backend must be selected:
 
 ```toml
 # Default
-jasonrpc = "0.4"
+jasonrpc = "0.5"
 
-# Or sonic-rs for faster parsing:
-jasonrpc = { version = "0.4", default-features = false, features = ["backend-sonic"] }
+# Or sonic-rs:
+jasonrpc = { version = "0.5", default-features = false, features = ["backend-sonic"] }
 ```
 
 The public API is backend-neutral -- user code never sees `serde_json::Value` or `sonic_rs::Value` directly.
