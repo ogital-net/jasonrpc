@@ -27,6 +27,9 @@ use std::sync::Arc;
 use crate::json::{self, JsonRawValue, Value};
 use crate::protocol::{Error, Id, Request, Response};
 
+/// Default maximum number of entries accepted in one batch request.
+pub const DEFAULT_MAX_BATCH_LEN: usize = 1024;
+
 /// Per-request context passed from the transport layer to handlers.
 ///
 /// When using HTTP integrations (`hyper` or `tower` feature), this carries
@@ -267,7 +270,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         Self {
             state,
             methods: Arc::new(HashMap::new()),
-            max_batch_len: None,
+            max_batch_len: Some(DEFAULT_MAX_BATCH_LEN),
         }
     }
 
@@ -299,8 +302,8 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     /// with more than `max` entries is rejected up front with a single Invalid
     /// Request (`-32600`) response and no handlers run.
     ///
-    /// Defaults to no limit. A limit of 0 rejects every batch (single requests
-    /// are unaffected).
+    /// Defaults to [`DEFAULT_MAX_BATCH_LEN`]. A limit of 0 rejects every batch
+    /// (single requests are unaffected).
     ///
     /// ```
     /// use jasonrpc::server::Router;
@@ -310,6 +313,16 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     #[must_use]
     pub fn with_max_batch_len(mut self, max: usize) -> Self {
         self.max_batch_len = Some(max);
+        self
+    }
+
+    /// Disable the batch length limit.
+    ///
+    /// This permits input-controlled allocation and work, so it should only be
+    /// used when the caller enforces an equivalent limit before dispatch.
+    #[must_use]
+    pub fn without_batch_limit(mut self) -> Self {
+        self.max_batch_len = None;
         self
     }
 
@@ -397,7 +410,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         // `[`) from a single request (object, `{`) without a full parse.
         let first = match bytes.iter().find(|b| !b.is_ascii_whitespace()) {
             Some(b) => *b,
-            None => return Output::Single(Response::error(Id::Null, Error::invalid_request())),
+            None => return Output::Single(Response::error(Id::Null, Error::parse_error())),
         };
         match first {
             b'[' => self.handle_batch_bytes_with_context(bytes, ctx).await,
@@ -491,7 +504,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     /// Process a batch with context.
     async fn handle_batch_bytes_with_context(&self, bytes: &[u8], ctx: RequestContext) -> Output {
         // Elements borrow from `bytes` — no per-element copy in the common case.
-        let items = if let Ok(items) = json::split_array(bytes) {
+        let split = if let Ok(items) = json::split_array(bytes, self.max_batch_len) {
             items
         } else {
             let is_json = json::from_slice::<Value>(bytes).is_ok();
@@ -505,26 +518,26 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
             ));
         };
 
-        if items.is_empty() {
+        if split.total_len == 0 {
             return Output::Single(Response::error(Id::Null, Error::invalid_request()));
         }
 
         // Reject oversized batches before running any handler, so a single
         // request can't fan out into unbounded sequential work.
         if let Some(max) = self.max_batch_len {
-            if items.len() > max {
+            if split.total_len > max {
                 return Output::Single(Response::error(
                     Id::Null,
                     Error::invalid_request().with_data(format!(
                         "batch of {} entries exceeds maximum of {max}",
-                        items.len()
+                        split.total_len
                     )),
                 ));
             }
         }
 
-        let mut responses = Vec::with_capacity(items.len());
-        for item in &items {
+        let mut responses = Vec::new();
+        for item in &split.items {
             if let Some(resp) = self.handle_element_bytes_with_context(item, &ctx).await {
                 responses.push(resp);
             }

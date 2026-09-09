@@ -57,7 +57,7 @@ tokio = ["transport", "dep:tokio"]
 uds = ["client", "tokio"]
 
 # --- Integrations ---
-hyper = ["server", "dep:hyper", "dep:http", "dep:http-body-util", "dep:bytes"]
+hyper = ["server", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:bytes"]
 # `tower` pulls in only the tiny `tower-service` + `http` traits, so it drops
 # into an axum/tower stack without dragging in the whole `tower` crate.
 tower = ["server", "dep:tower-service", "dep:http", "dep:http-body", "dep:http-body-util", "dep:bytes"]

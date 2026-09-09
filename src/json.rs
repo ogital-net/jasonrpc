@@ -10,6 +10,12 @@
 
 use std::fmt;
 
+#[cfg(feature = "server")]
+pub(crate) struct ArrayItems<'a> {
+    pub(crate) items: Vec<std::borrow::Cow<'a, [u8]>>,
+    pub(crate) total_len: usize,
+}
+
 /// A JSON-level error: parsing or serialization failed.
 ///
 /// Wraps the backend's error message. Callers decide what JSON-RPC error code
@@ -81,16 +87,46 @@ mod imp {
     /// Split a JSON array into the raw bytes of each element, preserving each
     /// element's exact serialization. Each element borrows from `bytes`.
     #[cfg(feature = "server")]
-    pub fn split_array(bytes: &[u8]) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, JsonError> {
-        // Borrow each element (`&RawValue`) directly out of the input rather
-        // than allocating a boxed copy per element; `get()` points back into
-        // `bytes`.
-        let raws: Vec<&serde_json::value::RawValue> =
-            serde_json::from_slice(bytes).map_err(|e| JsonError(e.to_string()))?;
-        Ok(raws
-            .into_iter()
-            .map(|r| std::borrow::Cow::Borrowed(r.get().as_bytes()))
-            .collect())
+    pub fn split_array(
+        bytes: &[u8],
+        max_items: Option<usize>,
+    ) -> Result<super::ArrayItems<'_>, JsonError> {
+        use serde::de::{SeqAccess, Visitor};
+        use serde::Deserializer;
+
+        struct ArrayVisitor {
+            max_items: Option<usize>,
+        }
+
+        impl<'de> Visitor<'de> for ArrayVisitor {
+            type Value = super::ArrayItems<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON array")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                let mut total_len = 0usize;
+                while let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? {
+                    total_len = total_len.saturating_add(1);
+                    if self.max_items.is_none_or(|max| items.len() < max) {
+                        items.push(std::borrow::Cow::Borrowed(raw.get().as_bytes()));
+                    }
+                }
+                Ok(super::ArrayItems { items, total_len })
+            }
+        }
+
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let items = deserializer
+            .deserialize_seq(ArrayVisitor { max_items })
+            .map_err(|e| JsonError(e.to_string()))?;
+        deserializer.end().map_err(|e| JsonError(e.to_string()))?;
+        Ok(items)
     }
 
     pub fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<super::JsonRawValue, JsonError> {
@@ -105,6 +141,10 @@ mod imp {
         raw: &super::JsonRawValue,
     ) -> Result<T, JsonError> {
         serde_json::from_str(raw.get()).map_err(|e| JsonError(e.to_string()))
+    }
+
+    pub fn raw_value_kind(raw: &super::JsonRawValue) -> super::RawValueKind {
+        super::classify_raw_value(raw.get().as_bytes())
     }
 }
 
@@ -137,20 +177,30 @@ mod imp {
     /// the element's raw text is unescaped (the common case), otherwise it is
     /// owned.
     #[cfg(feature = "server")]
-    pub fn split_array(bytes: &[u8]) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, JsonError> {
+    pub fn split_array(
+        bytes: &[u8],
+        max_items: Option<usize>,
+    ) -> Result<super::ArrayItems<'_>, JsonError> {
         use std::borrow::Cow;
         // `to_array_iter` lazily yields each element; `as_raw_cow` returns a
         // slice borrowing from `bytes` (the `'de` lifetime) for raw input,
         // owning only if the element required unescaping.
         let mut out = Vec::new();
+        let mut total_len = 0usize;
         for item in sonic_rs::to_array_iter(bytes) {
             let raw = item.map_err(|e| JsonError(e.to_string()))?;
-            out.push(match raw.as_raw_cow() {
-                Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-                Cow::Owned(s) => Cow::Owned(s.into_bytes()),
-            });
+            total_len = total_len.saturating_add(1);
+            if max_items.is_none_or(|max| out.len() < max) {
+                out.push(match raw.as_raw_cow() {
+                    Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+                    Cow::Owned(s) => Cow::Owned(s.into_bytes()),
+                });
+            }
         }
-        Ok(out)
+        Ok(super::ArrayItems {
+            items: out,
+            total_len,
+        })
     }
 
     pub fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<super::JsonRawValue, JsonError> {
@@ -168,6 +218,16 @@ mod imp {
     ) -> Result<T, JsonError> {
         let bytes = sonic_rs::to_vec(raw).map_err(|e| JsonError(e.to_string()))?;
         sonic_rs::from_slice(&bytes).map_err(|e| JsonError(e.to_string()))
+    }
+
+    pub fn raw_value_kind(raw: &super::JsonRawValue) -> super::RawValueKind {
+        use sonic_rs::{JsonType, JsonValueTrait};
+
+        match raw.get_type() {
+            JsonType::Null => super::RawValueKind::Null,
+            JsonType::Array | JsonType::Object => super::RawValueKind::Structured,
+            _ => super::RawValueKind::Scalar,
+        }
     }
 }
 
@@ -188,6 +248,26 @@ pub type JsonRawValue = Box<serde_json::value::RawValue>;
 /// `Box<serde_json::value::RawValue>` or `sonic_rs::OwnedLazyValue`.
 #[cfg(feature = "backend-sonic")]
 pub type JsonRawValue = sonic_rs::OwnedLazyValue;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawValueKind {
+    Null,
+    Structured,
+    Scalar,
+}
+
+#[cfg(feature = "backend-serde-json")]
+fn classify_raw_value(bytes: &[u8]) -> RawValueKind {
+    match bytes.iter().find(|byte| !byte.is_ascii_whitespace()) {
+        Some(b'n') => RawValueKind::Null,
+        Some(b'[' | b'{') => RawValueKind::Structured,
+        _ => RawValueKind::Scalar,
+    }
+}
+
+pub(crate) fn raw_value_kind(raw: &JsonRawValue) -> RawValueKind {
+    imp::raw_value_kind(raw)
+}
 
 /// Serialize a value into a `JsonRawValue`.
 pub(crate) fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<JsonRawValue, JsonError> {
@@ -261,6 +341,28 @@ pub(crate) fn string(s: &str) -> Value {
 /// borrowing from `bytes` where the backend allows, so a batch entry can be
 /// re-parsed from its own bytes without a copy in the common case.
 #[cfg(feature = "server")]
-pub(crate) fn split_array(bytes: &[u8]) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, JsonError> {
-    imp::split_array(bytes)
+pub(crate) fn split_array(
+    bytes: &[u8],
+    max_items: Option<usize>,
+) -> Result<ArrayItems<'_>, JsonError> {
+    imp::split_array(bytes, max_items)
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_array_retains_only_configured_items() {
+        let split = split_array(b"[1,2,3]", Some(2)).unwrap();
+        assert_eq!(split.total_len, 3);
+        assert_eq!(split.items.len(), 2);
+        assert_eq!(split.items[0], b"1".as_slice());
+        assert_eq!(split.items[1], b"2".as_slice());
+    }
+
+    #[test]
+    fn split_array_validates_elements_after_limit() {
+        assert!(split_array(b"[1,2,invalid]", Some(1)).is_err());
+    }
 }

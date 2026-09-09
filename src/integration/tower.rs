@@ -10,6 +10,9 @@
 //! The integration depends only on `tower-service`, `http`, and `http-body`,
 //! not the whole `tower` crate. Cross-cutting concerns such as authentication
 //! are applied as tower layers around this service rather than within it.
+//!
+//! Request bodies default to a 16 MiB limit. Use
+//! [`RpcService::with_max_request_body_size`] to tune it.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -19,10 +22,11 @@ use std::task::{Context, Poll};
 use ::http::{header, Request as HttpRequest, Response as HttpResponse, StatusCode};
 use bytes::Bytes;
 use http_body::Body;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use tower_service::Service;
 
-use crate::integration::http::{self, HttpOutcome};
+use crate::integration::http::{self, BodyCollection, HttpOutcome};
+use crate::integration::DEFAULT_MAX_REQUEST_BODY_SIZE;
 use crate::server::{RequestContext, Router};
 
 /// The response body type produced by this integration.
@@ -42,6 +46,7 @@ pub type ResponseBody = Full<Bytes>;
 /// ```
 pub struct RpcService<S> {
     router: Router<S>,
+    max_request_body_size: usize,
 }
 
 impl<S> std::fmt::Debug for RpcService<S> {
@@ -53,7 +58,18 @@ impl<S> std::fmt::Debug for RpcService<S> {
 impl<S> RpcService<S> {
     /// Wrap a router in a tower service.
     pub fn new(router: Router<S>) -> Self {
-        Self { router }
+        Self {
+            router,
+            max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
+        }
+    }
+
+    /// Set the maximum accepted request body size in bytes. A limit of 0
+    /// accepts only empty bodies.
+    #[must_use]
+    pub fn with_max_request_body_size(mut self, limit: usize) -> Self {
+        self.max_request_body_size = limit;
+        self
     }
 }
 
@@ -61,6 +77,7 @@ impl<S: Clone> Clone for RpcService<S> {
     fn clone(&self) -> Self {
         Self {
             router: self.router.clone(),
+            max_request_body_size: self.max_request_body_size,
         }
     }
 }
@@ -70,6 +87,7 @@ where
     S: Clone + Send + Sync + 'static,
     ReqBody: Body + Send + 'static,
     ReqBody::Data: Send,
+    ReqBody::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     type Response = HttpResponse<ResponseBody>;
     type Error = Infallible;
@@ -81,6 +99,7 @@ where
 
     fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let router = self.router.clone();
+        let max_request_body_size = self.max_request_body_size;
         Box::pin(async move {
             // Split to preserve extensions and headers before collecting the body.
             let (parts, body) = req.into_parts();
@@ -89,9 +108,14 @@ where
                 extensions: parts.extensions,
             };
 
-            let body = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => return Ok(json_response(StatusCode::OK, http::parse_error_body())),
+            let body = match http::collect_body(body, max_request_body_size).await {
+                BodyCollection::Bytes(body) => body,
+                BodyCollection::TooLarge => {
+                    return Ok(empty_response(StatusCode::PAYLOAD_TOO_LARGE))
+                }
+                BodyCollection::Failed => {
+                    return Ok(json_response(StatusCode::OK, http::parse_error_body()))
+                }
             };
 
             let HttpOutcome { status, body } =
@@ -117,12 +141,20 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> HttpResponse<ResponseBody
         .expect("valid json response")
 }
 
+fn empty_response(status: StatusCode) -> HttpResponse<ResponseBody> {
+    HttpResponse::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .expect("valid empty response")
+}
+
 #[cfg(test)]
 #[allow(clippy::ignored_unit_patterns)]
 mod tests {
     use super::*;
     use crate::json::Value;
     use crate::protocol::Request;
+    use http_body_util::BodyExt;
 
     fn router() -> Router<()> {
         Router::new().register(
@@ -159,5 +191,18 @@ mod tests {
 
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        let mut svc = RpcService::new(router()).with_max_request_body_size(8);
+        let req = HttpRequest::builder()
+            .body(Full::new(Bytes::from_static(
+                br#"{"jsonrpc":"2.0","method":"ping","id":1}"#,
+            )))
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

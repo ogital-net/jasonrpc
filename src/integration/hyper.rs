@@ -8,15 +8,19 @@
 //! single POST target and all dispatch happens by `method`, so authentication,
 //! authorization, and accounting belong in a layer around this service (see the
 //! gateway example) rather than within it.
+//!
+//! Request bodies default to a 16 MiB limit. Use
+//! [`HyperService::with_max_request_body_size`] to tune it.
 
 use std::convert::Infallible;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::Service;
 use hyper::{Request as HttpRequest, Response as HttpResponse, StatusCode};
 
-use crate::integration::http::{self, HttpOutcome};
+use crate::integration::http::{self, BodyCollection, HttpOutcome};
+use crate::integration::DEFAULT_MAX_REQUEST_BODY_SIZE;
 use crate::server::{RequestContext, Router};
 
 /// The HTTP body type produced by this integration.
@@ -41,12 +45,15 @@ pub type ResponseBody = Full<Bytes>;
 ///
 /// This function is infallible (`Error = Infallible`); the `Result` return
 /// type is for compatibility with the `Service` trait.
-pub(crate) async fn serve_request<S>(
+pub(crate) async fn serve_request<S, B>(
     router: Router<S>,
-    req: HttpRequest<Incoming>,
+    req: HttpRequest<B>,
+    max_request_body_size: usize,
 ) -> Result<HttpResponse<ResponseBody>, Infallible>
 where
     S: Clone + Send + Sync + 'static,
+    B: hyper::body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     // Split into parts and body so we can extract extensions and headers
     // before consuming the body.
@@ -56,9 +63,12 @@ where
         extensions: parts.extensions,
     };
 
-    let body = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return Ok(json_response(StatusCode::OK, http::parse_error_body())),
+    let body = match http::collect_body(body, max_request_body_size).await {
+        BodyCollection::Bytes(body) => body,
+        BodyCollection::TooLarge => return Ok(empty_response(StatusCode::PAYLOAD_TOO_LARGE)),
+        BodyCollection::Failed => {
+            return Ok(json_response(StatusCode::OK, http::parse_error_body()))
+        }
     };
 
     let HttpOutcome { status, body } = http::dispatch_with_context(&router, &body, ctx).await;
@@ -85,6 +95,13 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> HttpResponse<ResponseBody
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))
         .expect("valid json response")
+}
+
+fn empty_response(status: StatusCode) -> HttpResponse<ResponseBody> {
+    HttpResponse::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .expect("valid empty response")
 }
 
 /// A cloneable `hyper` service wrapping a [`Router`].
@@ -122,12 +139,14 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> HttpResponse<ResponseBody
 /// See the `hyper_demo` example for a complete client + server program.
 pub struct HyperService<S> {
     router: Router<S>,
+    max_request_body_size: usize,
 }
 
 impl<S: Clone> Clone for HyperService<S> {
     fn clone(&self) -> Self {
         Self {
             router: self.router.clone(),
+            max_request_body_size: self.max_request_body_size,
         }
     }
 }
@@ -141,7 +160,18 @@ impl<S> std::fmt::Debug for HyperService<S> {
 impl<S> HyperService<S> {
     /// Wrap a router.
     pub fn new(router: Router<S>) -> Self {
-        Self { router }
+        Self {
+            router,
+            max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
+        }
+    }
+
+    /// Set the maximum accepted request body size in bytes. A limit of 0
+    /// accepts only empty bodies.
+    #[must_use]
+    pub fn with_max_request_body_size(mut self, limit: usize) -> Self {
+        self.max_request_body_size = limit;
+        self
     }
 }
 
@@ -157,7 +187,8 @@ where
 
     fn call(&self, req: HttpRequest<Incoming>) -> Self::Future {
         let router = self.router.clone();
-        Box::pin(serve_request(router, req))
+        let max_request_body_size = self.max_request_body_size;
+        Box::pin(serve_request(router, req, max_request_body_size))
     }
 }
 
@@ -166,6 +197,7 @@ mod tests {
     use super::*;
     use crate::server::Router;
     use crate::Request;
+    use http_body_util::BodyExt;
 
     /// Build a hyper `Request<Full<Bytes>>` matching what `serve_request` accepts
     /// (the generic is erased via `into_body().collect()` inside `serve_request`).
@@ -180,9 +212,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A version of `serve_request` that accepts any `Body` (for testing).
-    /// The real `serve_request` takes `Incoming` specifically; this test helper
-    /// exercises the same internal `http::dispatch` path.
     async fn serve_test_request<S>(
         router: &Router<S>,
         req: HttpRequest<TestBody>,
@@ -190,20 +219,9 @@ mod tests {
     where
         S: Clone + Send + Sync + 'static,
     {
-        let body = match req.into_body().collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => return json_response(StatusCode::OK, http::parse_error_body()),
-        };
-        let HttpOutcome { status, body } = http::dispatch(router, &body).await;
-        if status == 204 {
-            HttpResponse::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Full::new(Bytes::new()))
-                .expect("valid 204 response")
-        } else {
-            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-            json_response(status, body)
-        }
+        serve_request(router.clone(), req, DEFAULT_MAX_REQUEST_BODY_SIZE)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -255,5 +273,25 @@ mod tests {
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
         let val = crate::json::from_slice::<crate::json::Value>(&collected).unwrap();
         assert_eq!(val["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        let router = Router::new();
+        let req = json_req(br#"{"jsonrpc":"2.0","method":"ping","id":1}"#);
+        let resp = serve_request(router, req, 8).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn body_at_limit_is_accepted() {
+        let router = Router::new().register("ping", |(), _req: Request| async move {
+            Ok::<_, crate::Error>("pong")
+        });
+        let body = br#"{"jsonrpc":"2.0","method":"ping","id":1}"#;
+        let resp = serve_request(router, json_req(body), body.len())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

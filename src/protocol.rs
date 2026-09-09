@@ -5,6 +5,7 @@
 //! (`server`, `client`, `transport`, integrations) build on top of these types.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -70,19 +71,70 @@ impl<'de> Deserialize<'de> for Version {
 /// A JSON-RPC request/response identifier.
 ///
 /// The original wire type is preserved: `"1"` (String) and `1` (Number) are
-/// distinct and never coerced into one another. `Null` is permitted but
-/// discouraged by the spec.
+/// distinct and never coerced into one another. Integer and finite fractional
+/// numbers are accepted; fractional ids are discouraged by the JSON-RPC spec.
+/// `Null` is permitted but also discouraged.
 ///
-/// `Hash` is derived so an `Id` can key a correlation map (used by the
-/// multiplexing client transport).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// `Hash` and equality allow equivalent non-negative signed and unsigned ids
+/// to key the same correlation-map entry.
+#[derive(Clone, Debug)]
 pub enum Id {
     /// A null id. Discouraged by the spec, but accepted.
     Null,
     /// A numeric id.
     Number(i64),
+    /// A non-negative numeric id larger than [`i64::MAX`].
+    Unsigned(u64),
+    /// A finite fractional numeric id.
+    Float(f64),
     /// A string id.
     String(String),
+}
+
+impl PartialEq for Id {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Id::Null, Id::Null) => true,
+            (Id::Number(a), Id::Number(b)) => a == b,
+            (Id::Unsigned(a), Id::Unsigned(b)) => a == b,
+            (Id::Number(a), Id::Unsigned(b)) | (Id::Unsigned(b), Id::Number(a)) => {
+                u64::try_from(*a).is_ok_and(|a| a == *b)
+            }
+            (Id::Float(a), Id::Float(b)) => a.to_bits() == b.to_bits(),
+            (Id::String(a), Id::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Id {}
+
+impl Hash for Id {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Id::Null => 0_u8.hash(state),
+            Id::Number(value) if *value < 0 => {
+                1_u8.hash(state);
+                value.hash(state);
+            }
+            Id::Number(value) => {
+                2_u8.hash(state);
+                (*value as u64).hash(state);
+            }
+            Id::Unsigned(value) => {
+                2_u8.hash(state);
+                value.hash(state);
+            }
+            Id::Float(value) => {
+                3_u8.hash(state);
+                value.to_bits().hash(state);
+            }
+            Id::String(value) => {
+                4_u8.hash(state);
+                value.hash(state);
+            }
+        }
+    }
 }
 
 impl Serialize for Id {
@@ -90,6 +142,8 @@ impl Serialize for Id {
         match self {
             Id::Null => s.serialize_none(),
             Id::Number(n) => s.serialize_i64(*n),
+            Id::Unsigned(n) => s.serialize_u64(*n),
+            Id::Float(n) => s.serialize_f64(*n),
             Id::String(v) => s.serialize_str(v),
         }
     }
@@ -103,6 +157,8 @@ impl fmt::Display for Id {
         match self {
             Id::Null => f.write_str("null"),
             Id::Number(n) => write!(f, "{n}"),
+            Id::Unsigned(n) => write!(f, "{n}"),
+            Id::Float(n) => write!(f, "{n}"),
             Id::String(s) => f.write_str(s),
         }
     }
@@ -115,7 +171,7 @@ impl<'de> Deserialize<'de> for Id {
             type Value = Id;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a string, integer, or null")
+                f.write_str("a string, finite number, or null")
             }
 
             fn visit_i64<E: de::Error>(self, v: i64) -> Result<Id, E> {
@@ -123,7 +179,15 @@ impl<'de> Deserialize<'de> for Id {
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Id, E> {
-                Ok(i64::try_from(v).map_or_else(|_| Id::String(v.to_string()), Id::Number))
+                Ok(i64::try_from(v).map_or(Id::Unsigned(v), Id::Number))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Id, E> {
+                if v.is_finite() {
+                    Ok(Id::Float(v))
+                } else {
+                    Err(E::custom("id must be a finite JSON number"))
+                }
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Id, E> {
@@ -153,6 +217,25 @@ impl<'de> Deserialize<'de> for Id {
 /// falls back to the container's `#[serde(default)]` (i.e. `None`).
 fn de_present_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Id>, D::Error> {
     Ok(Some(Id::deserialize(d)?))
+}
+
+fn de_params<'de, D: Deserializer<'de>>(d: D) -> Result<Option<JsonRawValue>, D::Error> {
+    let raw = JsonRawValue::deserialize(d)?;
+    match crate::json::raw_value_kind(&raw) {
+        crate::json::RawValueKind::Structured => Ok(Some(raw)),
+        crate::json::RawValueKind::Null | crate::json::RawValueKind::Scalar => {
+            Err(de::Error::custom("params must be an array or object"))
+        }
+    }
+}
+
+fn normalize_params<P: Serialize>(params: &P) -> Result<Option<JsonRawValue>, JsonError> {
+    let raw = crate::json::to_raw_value(params)?;
+    match crate::json::raw_value_kind(&raw) {
+        crate::json::RawValueKind::Null => Ok(None),
+        crate::json::RawValueKind::Structured => Ok(Some(raw)),
+        crate::json::RawValueKind::Scalar => crate::json::to_raw_value(&(params,)).map(Some),
+    }
 }
 
 /// The JSON-RPC 2.0 error object (a protocol value, distinct from a Rust error).
@@ -359,7 +442,11 @@ pub struct Request {
     method: String,
     /// Parameters as raw JSON. Use [`params_as`](Self::params_as) to
     /// deserialize into a concrete type.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "de_params"
+    )]
     params: Option<JsonRawValue>,
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -383,7 +470,7 @@ impl Request {
         Self {
             jsonrpc: Version,
             method: method.into(),
-            params: crate::json::to_raw_value(params).ok(),
+            params: normalize_params(params).ok().flatten(),
             id: Some(id),
         }
     }
@@ -404,7 +491,7 @@ impl Request {
         Ok(Self {
             jsonrpc: Version,
             method: method.into(),
-            params: Some(crate::json::to_raw_value(params)?),
+            params: normalize_params(params)?,
             id: Some(id),
         })
     }
@@ -416,7 +503,7 @@ impl Request {
         Self {
             jsonrpc: Version,
             method: method.into(),
-            params: crate::json::to_raw_value(params).ok(),
+            params: normalize_params(params).ok().flatten(),
             id: None,
         }
     }
@@ -436,7 +523,7 @@ impl Request {
         Ok(Self {
             jsonrpc: Version,
             method: method.into(),
-            params: Some(crate::json::to_raw_value(params)?),
+            params: normalize_params(params)?,
             id: None,
         })
     }
@@ -479,10 +566,9 @@ impl Request {
     /// Deserialize a single positional parameter.
     ///
     /// Convenience for the common single-argument method: it accepts either a
-    /// one-element positional array (`[value]`, the spec-conformant form a
-    /// client sends) or a bare `value`, and yields the inner `T`. This saves
-    /// defining a newtype or matching a one-element tuple for methods like
-    /// `device.get(id)`.
+    /// one-element positional array (`[value]`) and yields the inner `T`. This
+    /// saves defining a newtype or matching a one-element tuple for methods
+    /// like `device.get(id)`.
     ///
     /// Returns `None` if there are no params, if the array does not hold
     /// exactly one element, or if the element fails to deserialize into `T`.
@@ -495,21 +581,12 @@ impl Request {
     /// let req: Request =
     ///     jasonrpc::json::from_slice(br#"{"jsonrpc":"2.0","method":"get","params":[7],"id":1}"#)?;
     /// assert_eq!(req.param_as::<i64>(), Some(7));
-    ///
-    /// // A bare scalar `{"params": 7}` also works.
-    /// let req: Request =
-    ///     jasonrpc::json::from_slice(br#"{"jsonrpc":"2.0","method":"get","params":7,"id":1}"#)?;
-    /// assert_eq!(req.param_as::<i64>(), Some(7));
     /// # Ok(())
     /// # }
     /// ```
     #[must_use]
     pub fn param_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
-        // Prefer the spec form `[value]`; fall back to a bare `value`.
-        if let Some((value,)) = self.params_as::<(T,)>() {
-            return Some(value);
-        }
-        self.params_as::<T>()
+        self.params_as::<(T,)>().map(|(value,)| value)
     }
 }
 
@@ -686,9 +763,17 @@ mod tests {
         // u64 that fits in i64
         let id: Id = crate::json::from_slice(b"123").unwrap();
         assert_eq!(id, Id::Number(123));
-        // u64 beyond i64 range becomes a string
+        // u64 beyond i64 range remains a JSON number
         let id: Id = crate::json::from_slice(b"9999999999999999999").unwrap();
-        assert!(matches!(id, Id::String(..)), "got {id:?}");
+        assert_eq!(id, Id::Unsigned(9_999_999_999_999_999_999));
+        assert_eq!(crate::json::to_vec(&id).unwrap(), b"9999999999999999999");
+        let id: Id = crate::json::from_slice(b"1.5").unwrap();
+        assert_eq!(id, Id::Float(1.5));
+        assert_eq!(crate::json::to_vec(&id).unwrap(), b"1.5");
+        assert_eq!(Id::Unsigned(1), Id::Number(1));
+        let mut ids = std::collections::HashSet::new();
+        ids.insert(Id::Unsigned(1));
+        assert!(ids.contains(&Id::Number(1)));
         // null vs absent: when the field is present with null, it's Some(Null)
         let req: crate::Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","id":null}"#).unwrap();
@@ -828,17 +913,32 @@ mod tests {
                 .unwrap();
         assert_eq!(req.param_as::<i64>(), Some(7));
 
-        // Bare scalar also accepted.
-        let req: Request =
-            crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":7,"id":1}"#)
-                .unwrap();
-        assert_eq!(req.param_as::<i64>(), Some(7));
-
         // A single-element string array.
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":["hi"],"id":1}"#)
                 .unwrap();
         assert_eq!(req.param_as::<String>(), Some("hi".to_owned()));
+    }
+
+    #[test]
+    fn request_params_are_normalized_and_validated() {
+        let scalar = Request::call("m", &7, Id::Number(1));
+        assert_eq!(scalar.param_as::<i64>(), Some(7));
+        let bytes = crate::json::to_vec(&scalar).unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains("\"params\":[7]"));
+
+        let no_params = Request::call("m", &(), Id::Number(1));
+        let bytes = crate::json::to_vec(&no_params).unwrap();
+        assert!(!String::from_utf8(bytes).unwrap().contains("params"));
+
+        assert!(crate::json::from_slice::<Request>(
+            br#"{"jsonrpc":"2.0","method":"m","params":7,"id":1}"#
+        )
+        .is_err());
+        assert!(crate::json::from_slice::<Request>(
+            br#"{"jsonrpc":"2.0","method":"m","params":null,"id":1}"#
+        )
+        .is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@
 //! server-side HTTP upgrade using the `hyper` stack this crate already depends
 //! on.
 
-use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, WebSocket, WebSocketError};
+use fastwebsockets::{Frame, OpCode, Payload, WebSocket, WebSocketError};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::server::{RequestContext, Router};
@@ -37,6 +37,33 @@ use crate::server::{RequestContext, Router};
 /// the [`WebSocket`] once the response has been sent. Pass that socket to
 /// [`serve`].
 pub use fastwebsockets::upgrade;
+
+/// Default maximum WebSocket message size: 16 MiB.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// WebSocket serving limits.
+#[derive(Clone, Copy, Debug)]
+pub struct ServeConfig {
+    max_message_size: usize,
+}
+
+impl ServeConfig {
+    /// Set the maximum aggregate text or binary message size in bytes. A limit
+    /// of 0 accepts only empty messages.
+    #[must_use]
+    pub const fn with_max_message_size(mut self, limit: usize) -> Self {
+        self.max_message_size = limit;
+        self
+    }
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        }
+    }
+}
 
 /// Errors from driving a [`Router`] over a WebSocket connection.
 #[derive(Debug)]
@@ -68,6 +95,96 @@ impl From<WebSocketError> for WsError {
     }
 }
 
+enum MessageRead<'a> {
+    Frame(Frame<'a>),
+    TooLarge,
+}
+
+struct MessageSocket<S> {
+    socket: WebSocket<S>,
+    fragments: Option<(OpCode, Vec<u8>)>,
+    max_message_size: usize,
+}
+
+impl<S> MessageSocket<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(mut socket: WebSocket<S>, config: ServeConfig) -> Self {
+        socket.set_auto_close(true);
+        socket.set_auto_pong(true);
+        // Control frames may carry up to 125 bytes and are not application
+        // messages, so small configured limits must not reject valid control
+        // traffic in the underlying per-frame check.
+        socket.set_max_message_size(config.max_message_size.saturating_add(1).max(126));
+        Self {
+            socket,
+            fragments: None,
+            max_message_size: config.max_message_size,
+        }
+    }
+
+    async fn read_frame(&mut self) -> Result<MessageRead<'_>, WebSocketError> {
+        loop {
+            let frame = match self.socket.read_frame().await {
+                Ok(frame) => frame,
+                Err(WebSocketError::FrameTooLarge) => return Ok(MessageRead::TooLarge),
+                Err(error) => return Err(error),
+            };
+
+            match frame.opcode {
+                OpCode::Text | OpCode::Binary => {
+                    if self.fragments.is_some() {
+                        return Err(WebSocketError::InvalidFragment);
+                    }
+                    if frame.payload.len() > self.max_message_size {
+                        return Ok(MessageRead::TooLarge);
+                    }
+                    if frame.fin {
+                        return Ok(MessageRead::Frame(frame));
+                    }
+                    self.fragments = Some((frame.opcode, frame.payload.to_vec()));
+                }
+                OpCode::Continuation => {
+                    let Some((_, payload)) = self.fragments.as_mut() else {
+                        return Err(WebSocketError::InvalidContinuationFrame);
+                    };
+                    let Some(new_len) = payload.len().checked_add(frame.payload.len()) else {
+                        return Ok(MessageRead::TooLarge);
+                    };
+                    if new_len > self.max_message_size {
+                        return Ok(MessageRead::TooLarge);
+                    }
+                    payload.extend_from_slice(&frame.payload);
+                    if frame.fin {
+                        let (opcode, payload) = self.fragments.take().unwrap();
+                        if opcode == OpCode::Text && std::str::from_utf8(&payload).is_err() {
+                            return Err(WebSocketError::InvalidUTF8);
+                        }
+                        return Ok(MessageRead::Frame(Frame::new(
+                            true,
+                            opcode,
+                            None,
+                            payload.into(),
+                        )));
+                    }
+                }
+                _ => return Ok(MessageRead::Frame(frame)),
+            }
+        }
+    }
+
+    async fn write_frame(&mut self, frame: Frame<'_>) -> Result<(), WebSocketError> {
+        self.socket.write_frame(frame).await
+    }
+
+    async fn close_too_large(&mut self) {
+        let _ = self
+            .write_frame(Frame::close(1009, b"message too large"))
+            .await;
+    }
+}
+
 /// Drive a [`Router`] over an established WebSocket connection until the peer
 /// closes it or an error occurs.
 ///
@@ -86,13 +203,10 @@ impl From<WebSocketError> for WsError {
 ///
 /// # Message size limit
 ///
-/// `fastwebsockets` enforces a maximum message size (default 64 MiB) and closes
-/// the connection with an error if a peer exceeds it, which bounds per-message
-/// memory. To pick your own limit, call
-/// [`WebSocket::set_max_message_size`](fastwebsockets::WebSocket::set_max_message_size)
-/// on the socket before passing it here. Note the cap applies per *frame*; a
-/// peer sending many fragments of a single message can still accumulate beyond
-/// it, so set a limit appropriate to your workload for untrusted peers.
+/// Messages default to [`DEFAULT_MAX_MESSAGE_SIZE`], enforced across all
+/// fragments before dispatch. Use [`serve_with_config`] and
+/// [`ServeConfig::with_max_message_size`] to tune it. Oversized messages close
+/// the connection with status code `1009` (Message Too Big).
 ///
 /// # Errors
 ///
@@ -103,7 +217,20 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     State: Clone + Send + Sync + 'static,
 {
-    serve_with_context(socket, router, &RequestContext::default).await
+    serve_with_config(socket, router, ServeConfig::default()).await
+}
+
+/// Like [`serve`], with explicit serving limits.
+pub async fn serve_with_config<S, State>(
+    socket: WebSocket<S>,
+    router: &Router<State>,
+    config: ServeConfig,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    State: Clone + Send + Sync + 'static,
+{
+    serve_with_context_config(socket, router, &RequestContext::default, config).await
 }
 
 /// Like [`serve`], but builds a fresh [`RequestContext`] for each message via
@@ -120,7 +247,7 @@ where
 /// Returns a [`WsError`] if the WebSocket connection fails. A clean close
 /// returns `Ok(())`.
 pub async fn serve_with_context<S, State, F>(
-    mut socket: WebSocket<S>,
+    socket: WebSocket<S>,
     router: &Router<State>,
     make_ctx: &F,
 ) -> Result<(), WsError>
@@ -129,19 +256,31 @@ where
     State: Clone + Send + Sync + 'static,
     F: Fn() -> RequestContext,
 {
-    socket.set_auto_close(true);
-    socket.set_auto_pong(true);
+    serve_with_context_config(socket, router, make_ctx, ServeConfig::default()).await
+}
 
-    // Wrap in a `FragmentCollector` so a message split across several frames
-    // (fin=false plus `Continuation` frames) is reassembled into one payload
-    // before dispatch. `WebSocket::read_frame` alone yields raw frames and
-    // would hand a partial message to the router.
-    let mut socket = FragmentCollector::new(socket);
+/// Like [`serve_with_context`], with explicit serving limits.
+pub async fn serve_with_context_config<S, State, F>(
+    socket: WebSocket<S>,
+    router: &Router<State>,
+    make_ctx: &F,
+    config: ServeConfig,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    State: Clone + Send + Sync + 'static,
+    F: Fn() -> RequestContext,
+{
+    let mut socket = MessageSocket::new(socket, config);
 
     loop {
         // `read_frame` handles obligated sends (auto-pong / auto-close) itself.
         let frame = match socket.read_frame().await {
-            Ok(frame) => frame,
+            Ok(MessageRead::Frame(frame)) => frame,
+            Ok(MessageRead::TooLarge) => {
+                socket.close_too_large().await;
+                return Ok(());
+            }
             Err(WebSocketError::ConnectionClosed) => return Ok(()),
             Err(e) => return Err(WsError::WebSocket(e)),
         };
@@ -167,7 +306,7 @@ where
                 }
             }
             // Ping / Pong are handled by the library; Continuation frames are
-            // consumed by the `FragmentCollector` and never surface here.
+            // consumed by `MessageSocket` and never surface here.
             _ => {}
         }
     }
@@ -220,7 +359,23 @@ where
     State: Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()>,
 {
-    serve_with_context_shutdown(socket, router, &RequestContext::default, shutdown).await
+    serve_with_shutdown_config(socket, router, shutdown, ServeConfig::default()).await
+}
+
+/// Like [`serve_with_shutdown`], with explicit serving limits.
+pub async fn serve_with_shutdown_config<S, State, Fut>(
+    socket: WebSocket<S>,
+    router: &Router<State>,
+    shutdown: Fut,
+    config: ServeConfig,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    State: Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    serve_with_context_shutdown_config(socket, router, &RequestContext::default, shutdown, config)
+        .await
 }
 
 /// Like [`serve_with_context`], but stops cleanly when `shutdown` resolves.
@@ -235,7 +390,7 @@ where
 /// Returns a [`WsError`] if the WebSocket connection fails. A clean close —
 /// whether initiated by the peer or by `shutdown` — returns `Ok(())`.
 pub async fn serve_with_context_shutdown<S, State, F, Fut>(
-    mut socket: WebSocket<S>,
+    socket: WebSocket<S>,
     router: &Router<State>,
     make_ctx: &F,
     shutdown: Fut,
@@ -246,11 +401,25 @@ where
     F: Fn() -> RequestContext,
     Fut: std::future::Future<Output = ()>,
 {
-    socket.set_auto_close(true);
-    socket.set_auto_pong(true);
+    serve_with_context_shutdown_config(socket, router, make_ctx, shutdown, ServeConfig::default())
+        .await
+}
 
-    // Reassemble fragmented messages before dispatch. See `serve_with_context`.
-    let mut socket = FragmentCollector::new(socket);
+/// Like [`serve_with_context_shutdown`], with explicit serving limits.
+pub async fn serve_with_context_shutdown_config<S, State, F, Fut>(
+    socket: WebSocket<S>,
+    router: &Router<State>,
+    make_ctx: &F,
+    shutdown: Fut,
+    config: ServeConfig,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    State: Clone + Send + Sync + 'static,
+    F: Fn() -> RequestContext,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut socket = MessageSocket::new(socket, config);
 
     // Pin the shutdown future so it holds state across loop iterations: each
     // `select!` re-polls the *same* future rather than restarting it.
@@ -274,7 +443,11 @@ where
 
         // `read_frame` handles obligated sends (auto-pong / auto-close) itself.
         let frame = match frame {
-            Ok(frame) => frame,
+            Ok(MessageRead::Frame(frame)) => frame,
+            Ok(MessageRead::TooLarge) => {
+                socket.close_too_large().await;
+                return Ok(());
+            }
             Err(WebSocketError::ConnectionClosed) => return Ok(()),
             Err(e) => return Err(WsError::WebSocket(e)),
         };
@@ -448,6 +621,124 @@ mod tests {
 
         client.write_frame(Frame::close(1000, b"")).await.unwrap();
         let _ = server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_fragmented_message_closes_with_1009() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let ws = WebSocket::after_handshake(server_io, Role::Server);
+            serve_with_config(
+                ws,
+                &router(),
+                ServeConfig::default().with_max_message_size(8),
+            )
+            .await
+        });
+
+        let mut client = WebSocket::after_handshake(client_io, Role::Client);
+        client.set_auto_close(false);
+        client
+            .write_frame(Frame::new(
+                false,
+                OpCode::Text,
+                None,
+                Payload::Borrowed(b"12345"),
+            ))
+            .await
+            .unwrap();
+        client
+            .write_frame(Frame::new(
+                true,
+                OpCode::Continuation,
+                None,
+                Payload::Borrowed(b"6789"),
+            ))
+            .await
+            .unwrap();
+
+        let close = client.read_frame().await.unwrap();
+        assert_eq!(close.opcode, OpCode::Close);
+        assert_eq!(&close.payload[..2], &1009_u16.to_be_bytes());
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn fragmented_message_at_limit_is_accepted() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let full = br#"{"jsonrpc":"2.0","method":"add","params":[40,2],"id":7}"#;
+        let limit = full.len();
+        let server = tokio::spawn(async move {
+            let ws = WebSocket::after_handshake(server_io, Role::Server);
+            serve_with_config(
+                ws,
+                &router(),
+                ServeConfig::default().with_max_message_size(limit),
+            )
+            .await
+        });
+
+        let mut client = WebSocket::after_handshake(client_io, Role::Client);
+        let (first, second) = full.split_at(20);
+        client
+            .write_frame(Frame::new(
+                false,
+                OpCode::Text,
+                None,
+                Payload::Borrowed(first),
+            ))
+            .await
+            .unwrap();
+        client
+            .write_frame(Frame::new(
+                true,
+                OpCode::Continuation,
+                None,
+                Payload::Borrowed(second),
+            ))
+            .await
+            .unwrap();
+
+        let reply = client.read_frame().await.unwrap();
+        assert_eq!(reply.opcode, OpCode::Text);
+        assert!(String::from_utf8(reply.payload.to_vec())
+            .unwrap()
+            .contains("\"result\":42"));
+
+        client.write_frame(Frame::close(1000, b"")).await.unwrap();
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn control_frame_may_exceed_message_limit() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let ws = WebSocket::after_handshake(server_io, Role::Server);
+            serve_with_config(
+                ws,
+                &router(),
+                ServeConfig::default().with_max_message_size(1),
+            )
+            .await
+        });
+
+        let mut client = WebSocket::after_handshake(client_io, Role::Client);
+        client
+            .write_frame(Frame::new(
+                true,
+                OpCode::Ping,
+                None,
+                Payload::Borrowed(b"control"),
+            ))
+            .await
+            .unwrap();
+
+        let pong = client.read_frame().await.unwrap();
+        assert_eq!(pong.opcode, OpCode::Pong);
+        assert_eq!(pong.payload.as_ref(), b"control");
+
+        client.write_frame(Frame::close(1000, b"")).await.unwrap();
+        assert!(server.await.unwrap().is_ok());
     }
 
     /// `serve_with_shutdown` returns `Ok(())` and sends a Close frame when the

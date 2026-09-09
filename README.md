@@ -192,10 +192,10 @@ that handicaps SIMD parsing. On aarch64, NEON is already enabled by default.
 Implements [JSON-RPC 2.0](https://www.jsonrpc.org/specification) to the letter:
 
 - `jsonrpc` field must be `"2.0"`; anything else is rejected
-- `id` preserves original wire type (String, Number, Null)
+- `id` preserves original wire type (String, finite Number, Null)
+- `params`, when present, must be an Array or Object
 - Notifications (no `id`) produce no response
-- Batch processing with correct error semantics (sequential dispatch; cap batch
-  size with `Router::with_max_batch_len`)
+- Batch processing with correct error semantics (sequential dispatch; defaults to 1,024 entries and can be tuned with `Router::with_max_batch_len`)
 - Empty batches and malformed JSON produce spec-mandated error responses
 
 Run the spec's Section 7 examples as tests:
@@ -222,6 +222,10 @@ cargo test --test spec_conformance --features "server,tokio"
 | `tower` | `tower-service`, `http`, `http-body` | `RpcService` adapter (`server`) |
 | `websocket` | `fastwebsockets` | WebSocket `serve` adapter, reuses hyper (`server`) |
 | `http-client` | `hyper`, `hyper-util` | `HttpTransport` (`client`) |
+
+HTTP request bodies and WebSocket messages default to a 16 MiB limit. WebSocket
+limits include all fragments of a logical message. Configure smaller limits at
+the integration boundary for deployments that accept only small RPC payloads.
 
 ## License
 

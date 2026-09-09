@@ -25,7 +25,6 @@
 //! returns without registering a waiter.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
@@ -44,6 +43,8 @@ pub enum MultiplexError {
     /// The outgoing request bytes did not contain a usable `id`. Calls must be
     /// requests (with an id); use `send_notification` for id-less messages.
     MissingId,
+    /// Another request with the same id is already awaiting a response.
+    DuplicateId,
     /// The underlying connection closed or errored while a call was in flight.
     ConnectionClosed,
     /// A framing or I/O error on the shared connection.
@@ -55,6 +56,9 @@ impl std::fmt::Display for MultiplexError {
         match self {
             MultiplexError::MissingId => {
                 write!(f, "outgoing request has no id to correlate on")
+            }
+            MultiplexError::DuplicateId => {
+                write!(f, "another request with the same id is already in flight")
             }
             MultiplexError::ConnectionClosed => {
                 write!(f, "connection closed before a response arrived")
@@ -68,7 +72,9 @@ impl std::error::Error for MultiplexError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             MultiplexError::Transport(e) => Some(e),
-            MultiplexError::MissingId | MultiplexError::ConnectionClosed => None,
+            MultiplexError::MissingId
+            | MultiplexError::DuplicateId
+            | MultiplexError::ConnectionClosed => None,
         }
     }
 }
@@ -79,8 +85,12 @@ impl From<crate::error::TransportError> for MultiplexError {
     }
 }
 
-/// The map of in-flight requests: `id -> reply channel`.
-type Pending = Arc<Mutex<HashMap<Id, oneshot::Sender<Vec<u8>>>>>;
+struct ConnectionState {
+    connected: bool,
+    pending: HashMap<Id, oneshot::Sender<Vec<u8>>>,
+}
+
+type SharedState = Arc<Mutex<ConnectionState>>;
 
 /// RAII guard that removes a call's id from the pending map when dropped.
 ///
@@ -93,14 +103,14 @@ type Pending = Arc<Mutex<HashMap<Id, oneshot::Sender<Vec<u8>>>>>;
 /// every exit path — success, error, or cancellation — keeps the map bounded
 /// by the number of genuinely in-flight calls.
 struct PendingGuard<'a> {
-    pending: &'a Pending,
+    state: &'a SharedState,
     id: Option<Id>,
 }
 
 impl<'a> PendingGuard<'a> {
-    fn new(pending: &'a Pending, id: Id) -> Self {
+    fn new(state: &'a SharedState, id: Id) -> Self {
         Self {
-            pending,
+            state,
             id: Some(id),
         }
     }
@@ -115,7 +125,7 @@ impl<'a> PendingGuard<'a> {
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
-            self.pending.lock().unwrap().remove(&id);
+            self.state.lock().unwrap().pending.remove(&id);
         }
     }
 }
@@ -127,18 +137,13 @@ impl Drop for PendingGuard<'_> {
 /// to as many concurrent callers as you like.
 pub struct MultiplexTransport<W, F> {
     writer: Arc<AsyncMutex<FramedWriter<W, F>>>,
-    pending: Pending,
-    /// `true` while the background reader is alive. Flipped to `false` when the
-    /// reader loop exits (EOF or error), so callers can detect a dead
-    /// connection and fail fast instead of writing into a socket whose replies
-    /// will never be read.
-    connected: Arc<AtomicBool>,
+    state: SharedState,
 }
 
 impl<W, F> std::fmt::Debug for MultiplexTransport<W, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MultiplexTransport")
-            .field("connected", &self.connected.load(Ordering::Relaxed))
+            .field("connected", &self.state.lock().unwrap().connected)
             .finish()
     }
 }
@@ -147,8 +152,7 @@ impl<W, F> Clone for MultiplexTransport<W, F> {
     fn clone(&self) -> Self {
         Self {
             writer: Arc::clone(&self.writer),
-            pending: Arc::clone(&self.pending),
-            connected: Arc::clone(&self.connected),
+            state: Arc::clone(&self.state),
         }
     }
 }
@@ -171,8 +175,10 @@ where
     /// calls fail with [`MultiplexError::ConnectionClosed`].
     pub fn new(stream: S, framing: F) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let connected = Arc::new(AtomicBool::new(true));
+        let state = Arc::new(Mutex::new(ConnectionState {
+            connected: true,
+            pending: HashMap::new(),
+        }));
 
         let writer = Arc::new(AsyncMutex::new(FramedWriter::new(
             write_half,
@@ -181,34 +187,23 @@ where
 
         // Spawn the reader task: decode frames, route by id.
         let reader = FramedReader::new(read_half, framing);
-        tokio::spawn(reader_loop(
-            reader,
-            Arc::clone(&pending),
-            Arc::clone(&connected),
-        ));
+        tokio::spawn(reader_loop(reader, Arc::clone(&state)));
 
-        MultiplexTransport {
-            writer,
-            pending,
-            connected,
-        }
+        MultiplexTransport { writer, state }
     }
 }
 
 /// The background reader: pull frames, parse ids, deliver to waiters. On any
 /// end-of-stream or error, drop all waiters (their receivers resolve to Err).
-async fn reader_loop<R, F>(
-    mut reader: FramedReader<R, F>,
-    pending: Pending,
-    connected: Arc<AtomicBool>,
-) where
+async fn reader_loop<R, F>(mut reader: FramedReader<R, F>, state: SharedState)
+where
     R: AsyncRead + Unpin,
     F: Framing,
 {
     loop {
         if let Ok(Some(frame)) = reader.recv().await {
             if let Some(id) = parse_id(&frame) {
-                let waiter = pending.lock().unwrap().remove(&id);
+                let waiter = state.lock().unwrap().pending.remove(&id);
                 if let Some(tx) = waiter {
                     // Ignore send error: the caller may have gone away.
                     let _ = tx.send(frame);
@@ -219,10 +214,11 @@ async fn reader_loop<R, F>(
             // that we can't attribute) is dropped; the affected caller will
             // time out or fail when the connection ends.
         } else {
-            // Clean EOF or error: mark the connection dead so future calls fail
-            // fast, then fail everyone still waiting.
-            connected.store(false, Ordering::Release);
-            pending.lock().unwrap().clear();
+            // Marking the connection dead and clearing waiters under the same
+            // lock makes teardown atomic with new waiter registration.
+            let mut state = state.lock().unwrap();
+            state.connected = false;
+            state.pending.clear();
             return;
         }
     }
@@ -245,12 +241,6 @@ where
     type Error = MultiplexError;
 
     async fn round_trip(&self, request: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
-        // If the reader has already exited, no reply can ever arrive; fail now
-        // rather than writing into a dead socket and hanging on the oneshot.
-        if !self.is_connected() {
-            return Err(MultiplexError::ConnectionClosed);
-        }
-
         // The id must be recoverable from the request so we can correlate the
         // reply. `Client` always includes one for calls.
         let id = parse_id(&request).ok_or(MultiplexError::MissingId)?;
@@ -260,13 +250,25 @@ where
         // Register the waiter BEFORE writing, so a fast reply can't race us.
         // The guard removes our id from the pending map on every exit path,
         // including if this future is dropped mid-await (timeout/cancellation).
-        self.pending.lock().unwrap().insert(id.clone(), tx);
-        let guard = PendingGuard::new(&self.pending, id);
+        {
+            let mut state = self.state.lock().unwrap();
+            if !state.connected {
+                return Err(MultiplexError::ConnectionClosed);
+            }
+            if state.pending.contains_key(&id) {
+                return Err(MultiplexError::DuplicateId);
+            }
+            state.pending.insert(id.clone(), tx);
+        }
+        let guard = PendingGuard::new(&self.state, id);
 
         // Write the frame while holding the writer lock, then release it so
         // other calls can proceed while we await our reply. On write failure
         // the guard cleans up the pending entry as it drops.
-        self.write_frame(&request).await?;
+        if let Err(error) = self.write_frame(&request).await {
+            self.disconnect();
+            return Err(error);
+        }
 
         // Await the reply; an Err means the reader dropped our sender.
         let reply = rx.await.map_err(|_| MultiplexError::ConnectionClosed);
@@ -279,7 +281,11 @@ where
             return Err(MultiplexError::ConnectionClosed);
         }
         // No id, no waiter -- just write it.
-        self.write_frame(&notification).await
+        if let Err(error) = self.write_frame(&notification).await {
+            self.disconnect();
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -293,18 +299,24 @@ where
         writer.send(frame).await.map_err(MultiplexError::from)
     }
 
+    fn disconnect(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.connected = false;
+        state.pending.clear();
+    }
+
     /// Whether the background reader is still alive. Returns `false` once the
     /// connection has closed or errored, after which every call fails with
     /// [`MultiplexError::ConnectionClosed`].
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
+        self.state.lock().unwrap().connected
     }
 
     /// The number of in-flight calls currently registered in the pending map.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "netstring"))]
     fn pending_len(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        self.state.lock().unwrap().pending.len()
     }
 }
 
@@ -434,6 +446,107 @@ mod tests {
             0,
             "pending map must be empty after a cancelled call"
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_in_flight_id_is_rejected() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let (r, _w) = tokio::io::split(server_io);
+            let mut reader = FramedReader::new(r, Netstring);
+            while let Ok(Some(_frame)) = reader.recv().await {}
+        });
+
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let first_transport = transport.clone();
+        let request = br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec();
+        let first_request = request.clone();
+        let first = tokio::spawn(async move { first_transport.round_trip(first_request).await });
+
+        while transport.pending_len() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let err = transport.round_trip(request).await.unwrap_err();
+        assert!(matches!(err, MultiplexError::DuplicateId));
+        assert_eq!(transport.pending_len(), 1);
+
+        first.abort();
+        let _ = first.await;
+        tokio::task::yield_now().await;
+        assert_eq!(transport.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_failure_disconnects_all_pending_calls() {
+        struct FailSecondWrite {
+            writes: usize,
+        }
+
+        impl tokio::io::AsyncRead for FailSecondWrite {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl tokio::io::AsyncWrite for FailSecondWrite {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<Result<usize, std::io::Error>> {
+                if self.writes == 0 {
+                    self.writes += 1;
+                    std::task::Poll::Ready(Ok(buf.len()))
+                } else {
+                    std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "write failed",
+                    )))
+                }
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), std::io::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), std::io::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let transport = MultiplexTransport::new(FailSecondWrite { writes: 0 }, Netstring);
+        let first_transport = transport.clone();
+        let first = tokio::spawn(async move {
+            first_transport
+                .round_trip(br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec())
+                .await
+        });
+
+        while transport.pending_len() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let second = transport
+            .round_trip(br#"{"jsonrpc":"2.0","method":"m","id":2}"#.to_vec())
+            .await;
+        assert!(matches!(second, Err(MultiplexError::Transport(_))));
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(MultiplexError::ConnectionClosed)
+        ));
+        assert!(!transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
     }
 
     #[test]

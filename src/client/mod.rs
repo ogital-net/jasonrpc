@@ -56,10 +56,7 @@ impl IdGen {
 
     /// Allocate the next numeric id.
     pub fn next_id(&self) -> Id {
-        // Cast is safe: JSON-RPC ids are small; wrapping after 2^63 calls is
-        // acceptable (and the id would be a String at that point anyway).
-        #[allow(clippy::cast_possible_wrap)]
-        Id::Number(self.next.fetch_add(1, Ordering::Relaxed) as i64)
+        Id::Unsigned(self.next.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -390,6 +387,15 @@ mod tests {
     }
 
     #[test]
+    fn id_gen_uses_unsigned_ids_across_signed_boundary() {
+        let ids = IdGen {
+            next: AtomicU64::new(i64::MAX as u64),
+        };
+        assert_eq!(ids.next_id(), Id::Unsigned(i64::MAX as u64));
+        assert_eq!(ids.next_id(), Id::Unsigned(i64::MAX as u64 + 1));
+    }
+
+    #[test]
     fn encode_call_propagates_param_serialization_error() {
         struct Bad;
         impl serde::Serialize for Bad {
@@ -440,7 +446,7 @@ mod tests {
         let parsed: crate::Request = json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.method(), "my_method");
         assert!(parsed.is_notification());
-        let result: i64 = parsed.params_as().unwrap();
+        let result: i64 = parsed.param_as().unwrap();
         assert_eq!(result, 42);
     }
 

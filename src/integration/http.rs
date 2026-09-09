@@ -5,7 +5,29 @@
 //! response body. That middle step is identical regardless of the surrounding
 //! HTTP types, so it lives here and both adapters call it.
 
+use bytes::Bytes;
+use http_body::Body;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
+
 use crate::server::{RequestContext, Router};
+
+pub(crate) enum BodyCollection {
+    Bytes(Bytes),
+    TooLarge,
+    Failed,
+}
+
+pub(crate) async fn collect_body<B>(body: B, limit: usize) -> BodyCollection
+where
+    B: Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    match Limited::new(body, limit).collect().await {
+        Ok(collected) => BodyCollection::Bytes(collected.to_bytes()),
+        Err(error) if error.is::<LengthLimitError>() => BodyCollection::TooLarge,
+        Err(_) => BodyCollection::Failed,
+    }
+}
 
 /// The outcome of dispatching an HTTP request body through the router: an HTTP
 /// status code and the raw response body bytes (empty for `204`).

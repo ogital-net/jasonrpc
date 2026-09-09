@@ -129,6 +129,13 @@ async fn invalid_json_is_parse_error() {
 }
 
 #[tokio::test]
+async fn whitespace_only_is_parse_error() {
+    let out = call(&spec_router(), b" \r\n\t").await;
+    assert!(out.contains("-32700"), "{out}");
+    assert!(out.contains("\"id\":null"), "{out}");
+}
+
+#[tokio::test]
 async fn invalid_request_object() {
     let r = spec_router();
     // `method` is a Number, not a String.
@@ -253,4 +260,26 @@ async fn invalid_params_type() {
     )
     .await;
     assert!(out.contains("-32602"), "{out}");
+}
+
+#[tokio::test]
+async fn scalar_params_are_an_invalid_request() {
+    let out = call(
+        &spec_router(),
+        br#"{"jsonrpc":"2.0","method":"subtract","params":7,"id":1}"#,
+    )
+    .await;
+    assert!(out.contains("-32600"), "{out}");
+    assert!(out.contains("\"id\":null"), "{out}");
+}
+
+#[tokio::test]
+async fn large_unsigned_id_remains_numeric() {
+    let out = call(
+        &spec_router(),
+        br#"{"jsonrpc":"2.0","method":"get_data","id":9999999999999999999}"#,
+    )
+    .await;
+    assert!(out.contains("\"id\":9999999999999999999"), "{out}");
+    assert!(!out.contains("\"id\":\"9999999999999999999\""), "{out}");
 }

@@ -295,6 +295,11 @@ impl Framing for ContentLength {
             return Ok(None); // headers still arriving
         };
         let header_end = sep + 4; // past the blank-line separator
+        if header_end > Self::MAX_HEADER_BYTES {
+            return Err(TransportError::Frame(
+                "content-length header block too long".into(),
+            ));
+        }
         let headers = &src[..sep];
 
         // Scan headers for Content-Length (case-insensitive name).
@@ -311,7 +316,11 @@ impl Framing for ContentLength {
                 let parsed = value
                     .and_then(|v| v.parse::<usize>().ok())
                     .ok_or_else(|| TransportError::Frame("invalid content-length value".into()))?;
-                content_len = Some(parsed);
+                if content_len.replace(parsed).is_some() {
+                    return Err(TransportError::Frame(
+                        "duplicate content-length header".into(),
+                    ));
+                }
             }
             // Other headers (e.g. Content-Type) are ignored.
         }
@@ -487,10 +496,16 @@ pub mod io {
                 )));
             }
 
+            let read_len = if self.max_frame_size > 0 {
+                CHUNK_SIZE.min(self.max_frame_size - start)
+            } else {
+                CHUNK_SIZE
+            };
+
             // Grow to receive up to CHUNK_SIZE bytes into the tail, read into
             // that slice, then shrink back to what actually arrived.
             let timeout = self.read_timeout;
-            self.read_buf.resize(start + CHUNK_SIZE, 0);
+            self.read_buf.resize(start + read_len, 0);
             let read_result = {
                 let dst = &mut self.read_buf[start..];
                 match timeout {
@@ -509,13 +524,6 @@ pub mod io {
                 }
             };
             self.read_buf.truncate(start + n);
-
-            if self.max_frame_size > 0 && self.read_buf.len() > self.max_frame_size {
-                return Err(TransportError::Frame(format!(
-                    "frame exceeds max size of {} bytes",
-                    self.max_frame_size
-                )));
-            }
             Ok(n)
         }
     }
@@ -791,6 +799,15 @@ mod content_length_tests {
     }
 
     #[test]
+    fn duplicate_length_errors() {
+        let f = ContentLength;
+        let err = f
+            .decode(b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}")
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Frame(ref m) if m.contains("duplicate")));
+    }
+
+    #[test]
     fn malformed_header_line_errors() {
         let f = ContentLength;
         let err = f.decode(b"NoColonHere\r\n\r\n{}").unwrap_err();
@@ -804,6 +821,26 @@ mod content_length_tests {
         let junk = vec![b'x'; ContentLength::MAX_HEADER_BYTES + 1];
         let err = f.decode(&junk).unwrap_err();
         assert!(matches!(err, TransportError::Frame(ref m) if m.contains("header block too long")));
+    }
+
+    #[test]
+    fn completed_oversized_header_block_errors() {
+        let f = ContentLength;
+        let mut frame = vec![b'x'; ContentLength::MAX_HEADER_BYTES + 1];
+        frame.extend_from_slice(b"\r\n\r\n");
+        let err = f.decode(&frame).unwrap_err();
+        assert!(matches!(err, TransportError::Frame(ref m) if m.contains("header block too long")));
+    }
+
+    #[test]
+    fn completed_header_at_limit_is_accepted() {
+        let f = ContentLength;
+        let mut frame = b"Content-Length: 0\r\nX-Fill: ".to_vec();
+        frame.resize(ContentLength::MAX_HEADER_BYTES - 4, b'x');
+        frame.extend_from_slice(b"\r\n\r\n");
+        let (message, consumed) = f.decode(&frame).unwrap().unwrap();
+        assert!(message.is_empty());
+        assert_eq!(consumed, ContentLength::MAX_HEADER_BYTES);
     }
 
     #[test]
@@ -986,6 +1023,19 @@ mod framed_io_tests {
             matches!(err, TransportError::Frame(ref m) if m.contains("exceeds max size")),
             "expected size error, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn max_frame_size_allows_coalesced_frames() {
+        use io::FramedReader;
+        use std::io::Cursor;
+
+        let data = Cursor::new(b"first\nsecond\n");
+        let mut reader = FramedReader::new(data, Newline).with_max_frame_size(7);
+
+        assert_eq!(reader.recv().await.unwrap(), Some(b"first".to_vec()));
+        assert_eq!(reader.recv().await.unwrap(), Some(b"second".to_vec()));
+        assert_eq!(reader.recv().await.unwrap(), None);
     }
 
     #[tokio::test]
