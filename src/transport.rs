@@ -439,6 +439,17 @@ pub mod io {
         max_frame_size: usize,
     }
 
+    struct ReadBufferGuard<'a> {
+        buffer: &'a mut Vec<u8>,
+        filled_len: usize,
+    }
+
+    impl Drop for ReadBufferGuard<'_> {
+        fn drop(&mut self) {
+            self.buffer.truncate(self.filled_len);
+        }
+    }
+
     impl ReadCore {
         fn new() -> Self {
             Self {
@@ -506,8 +517,12 @@ pub mod io {
             // that slice, then shrink back to what actually arrived.
             let timeout = self.read_timeout;
             self.read_buf.resize(start + read_len, 0);
+            let mut guard = ReadBufferGuard {
+                buffer: &mut self.read_buf,
+                filled_len: start,
+            };
             let read_result = {
-                let dst = &mut self.read_buf[start..];
+                let dst = &mut guard.buffer[start..];
                 match timeout {
                     Some(to) => tokio::time::timeout(to, inner.read(dst))
                         .await
@@ -516,14 +531,8 @@ pub mod io {
                     None => inner.read(dst).await.map_err(TransportError::from),
                 }
             };
-            let n = match read_result {
-                Ok(n) => n,
-                Err(e) => {
-                    self.read_buf.truncate(start);
-                    return Err(e);
-                }
-            };
-            self.read_buf.truncate(start + n);
+            let n = read_result?;
+            guard.filled_len = start + n;
             Ok(n)
         }
     }
@@ -584,6 +593,11 @@ pub mod io {
         }
 
         /// Read a single complete payload, or `None` at clean end-of-stream.
+        ///
+        /// # Cancel Safety
+        ///
+        /// Cancelling a pending receive preserves buffered frame bytes for the
+        /// next call. Buffered bytes are also retained after a read timeout.
         ///
         /// # Errors
         ///
@@ -688,6 +702,11 @@ pub mod io {
         }
 
         /// Read a single complete payload, or `None` at clean end-of-stream.
+        ///
+        /// # Cancel Safety
+        ///
+        /// Cancelling a pending receive preserves buffered frame bytes for the
+        /// next call. Buffered bytes are also retained after a read timeout.
         ///
         /// # Errors
         ///
@@ -959,6 +978,15 @@ mod framed_io_tests {
     use super::*;
     use io::FramedWriter;
 
+    async fn cancel_pending(future: impl std::future::Future) {
+        let mut future = Box::pin(future);
+        std::future::poll_fn(|context| {
+            assert!(future.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn framed_writer_send() {
         // Sink that captures the written bytes.
@@ -1008,6 +1036,108 @@ mod framed_io_tests {
             matches!(err, TransportError::Frame(ref m) if m.contains("timed out")),
             "expected timeout, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_timeout_preserves_buffered_frame() {
+        use io::FramedReader;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        for (prefix, suffix) in [
+            (b"".as_slice(), b"{}\n".as_slice()),
+            (b"{".as_slice(), b"}\n".as_slice()),
+        ] {
+            let (read_half, mut write_half) = tokio::io::duplex(64);
+            let mut reader = FramedReader::new(read_half, Newline)
+                .with_read_timeout(Duration::from_millis(10))
+                .with_max_frame_size(3);
+            write_half.write_all(prefix).await.unwrap();
+
+            let error = reader.recv().await.unwrap_err();
+            assert!(
+                matches!(error, TransportError::Frame(ref message) if message.contains("timed out"))
+            );
+
+            write_half.write_all(suffix).await.unwrap();
+            assert_eq!(reader.recv().await.unwrap(), Some(b"{}".to_vec()));
+            drop(write_half);
+            assert_eq!(reader.recv().await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn conn_read_timeout_preserves_buffered_frame() {
+        use io::FramedConn;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        for (prefix, suffix) in [
+            (b"".as_slice(), b"{}\n".as_slice()),
+            (b"{".as_slice(), b"}\n".as_slice()),
+        ] {
+            let (stream, mut peer) = tokio::io::duplex(64);
+            let mut connection = FramedConn::new(stream, Newline)
+                .with_read_timeout(Duration::from_millis(10))
+                .with_max_frame_size(3);
+            peer.write_all(prefix).await.unwrap();
+
+            let error = connection.recv().await.unwrap_err();
+            assert!(
+                matches!(error, TransportError::Frame(ref message) if message.contains("timed out"))
+            );
+
+            peer.write_all(suffix).await.unwrap();
+            assert_eq!(connection.recv().await.unwrap(), Some(b"{}".to_vec()));
+            drop(peer);
+            assert_eq!(connection.recv().await.unwrap(), None);
+        }
+    }
+
+    #[cfg(feature = "netstring")]
+    #[tokio::test]
+    async fn cancelled_read_preserves_buffered_frame() {
+        use io::FramedReader;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        for (prefix, suffix) in [
+            (b"".as_slice(), b"2:{},".as_slice()),
+            (b"2:{".as_slice(), b"},".as_slice()),
+        ] {
+            let (read_half, mut write_half) = tokio::io::duplex(64);
+            let mut reader = FramedReader::new(read_half, Netstring)
+                .with_read_timeout(Duration::from_secs(1))
+                .with_max_frame_size(5);
+            write_half.write_all(prefix).await.unwrap();
+            cancel_pending(reader.recv()).await;
+
+            write_half.write_all(suffix).await.unwrap();
+            assert_eq!(reader.recv().await.unwrap(), Some(b"{}".to_vec()));
+            drop(write_half);
+            assert_eq!(reader.recv().await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_conn_read_preserves_buffered_frame() {
+        use io::FramedConn;
+        use tokio::io::AsyncWriteExt;
+
+        for (prefix, suffix) in [
+            (b"".as_slice(), b"{}\n".as_slice()),
+            (b"{".as_slice(), b"}\n".as_slice()),
+        ] {
+            let (stream, mut peer) = tokio::io::duplex(64);
+            let mut connection = FramedConn::new(stream, Newline).with_max_frame_size(3);
+            peer.write_all(prefix).await.unwrap();
+            cancel_pending(connection.recv()).await;
+
+            peer.write_all(suffix).await.unwrap();
+            assert_eq!(connection.recv().await.unwrap(), Some(b"{}".to_vec()));
+            drop(peer);
+            assert_eq!(connection.recv().await.unwrap(), None);
+        }
     }
 
     #[tokio::test]
