@@ -130,11 +130,30 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
+struct WriteGuard<'a> {
+    state: &'a SharedState,
+    completed: bool,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut state = self.state.lock().unwrap();
+            state.connected = false;
+            state.pending.clear();
+        }
+    }
+}
+
 /// A multiplexing transport over a single shared, framed connection.
 ///
 /// Cheap to clone: clones share the same underlying connection, writer lock,
 /// and pending map. Build one with [`MultiplexTransport::new`] and hand clones
 /// to as many concurrent callers as you like.
+///
+/// Cancelling an in-progress frame write invalidates the connection and fails
+/// all pending calls with [`MultiplexError::ConnectionClosed`]. Cancelling while
+/// waiting for the writer lock or a response leaves the connection usable.
 pub struct MultiplexTransport<W, F> {
     writer: Arc<AsyncMutex<FramedWriter<W, F>>>,
     state: SharedState,
@@ -265,10 +284,7 @@ where
         // Write the frame while holding the writer lock, then release it so
         // other calls can proceed while we await our reply. On write failure
         // the guard cleans up the pending entry as it drops.
-        if let Err(error) = self.write_frame(&request).await {
-            self.disconnect();
-            return Err(error);
-        }
+        self.write_frame(&request).await?;
 
         // Await the reply; an Err means the reader dropped our sender.
         let reply = rx.await.map_err(|_| MultiplexError::ConnectionClosed);
@@ -281,11 +297,7 @@ where
             return Err(MultiplexError::ConnectionClosed);
         }
         // No id, no waiter -- just write it.
-        if let Err(error) = self.write_frame(&notification).await {
-            self.disconnect();
-            return Err(error);
-        }
-        Ok(())
+        self.write_frame(&notification).await
     }
 }
 
@@ -296,18 +308,22 @@ where
 {
     async fn write_frame(&self, frame: &[u8]) -> Result<(), MultiplexError> {
         let mut writer = self.writer.lock().await;
-        writer.send(frame).await.map_err(MultiplexError::from)
+        if !self.is_connected() {
+            return Err(MultiplexError::ConnectionClosed);
+        }
+
+        let mut guard = WriteGuard {
+            state: &self.state,
+            completed: false,
+        };
+        writer.send(frame).await.map_err(MultiplexError::from)?;
+        guard.completed = true;
+        Ok(())
     }
 
-    fn disconnect(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.connected = false;
-        state.pending.clear();
-    }
-
-    /// Whether the background reader is still alive. Returns `false` once the
-    /// connection has closed or errored, after which every call fails with
-    /// [`MultiplexError::ConnectionClosed`].
+    /// Whether the shared connection is still usable. Returns `false` once the
+    /// connection closes, errors, or an in-progress write is cancelled, after
+    /// which every call fails with [`MultiplexError::ConnectionClosed`].
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.state.lock().unwrap().connected
@@ -326,6 +342,14 @@ mod tests {
     use crate::client::Client;
     use crate::transport::io::{FramedReader, FramedWriter};
     use crate::transport::Netstring;
+
+    async fn assert_pending(mut future: std::pin::Pin<&mut impl std::future::Future>) {
+        std::future::poll_fn(|context| {
+            assert!(future.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
 
     /// A mock server over one end of an in-memory duplex that echoes each call
     /// back as a result, optionally after a per-method delay so replies can be
@@ -446,6 +470,166 @@ mod tests {
             0,
             "pending map must be empty after a cancelled call"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_write_timeout_disconnects() {
+        use tokio::io::AsyncReadExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(16);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let client = Client::new(transport.clone())
+            .with_request_timeout(std::time::Duration::from_millis(10));
+
+        let error = client
+            .call::<_, String>("large", ("x".repeat(4096),))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::error::ClientError::Timeout(_)));
+
+        let mut partial_frame = [0; 16];
+        server_io.read_exact(&mut partial_frame).await.unwrap();
+        assert!(partial_frame.contains(&b':'));
+        assert!(!transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+
+        let error = transport
+            .round_trip(br#"{"jsonrpc":"2.0","method":"next","id":2}"#.to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MultiplexError::ConnectionClosed));
+
+        let error = transport
+            .send_notification(br#"{"jsonrpc":"2.0","method":"next"}"#.to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MultiplexError::ConnectionClosed));
+    }
+
+    #[tokio::test]
+    async fn partial_flush_timeout_disconnects() {
+        use tokio::io::AsyncReadExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(16);
+        let buffered_io = tokio::io::BufStream::with_capacity(1024, 8192, client_io);
+        let transport = MultiplexTransport::new(buffered_io, Netstring);
+        let client = Client::new(transport.clone())
+            .with_request_timeout(std::time::Duration::from_millis(10));
+
+        let error = client
+            .call::<_, String>("large", ("x".repeat(4096),))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::error::ClientError::Timeout(_)));
+
+        let mut partial_frame = [0; 16];
+        server_io.read_exact(&mut partial_frame).await.unwrap();
+        assert!(partial_frame.contains(&b':'));
+        assert!(!transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_write_fails_pending_and_queued_sends() {
+        use tokio::io::AsyncReadExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(128);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+
+        let mut waiting_reply = Box::pin(
+            transport.round_trip(br#"{"jsonrpc":"2.0","method":"first","id":100}"#.to_vec()),
+        );
+        assert_pending(waiting_reply.as_mut()).await;
+
+        let (request, _) =
+            crate::client::encode_call("large", &("x".repeat(4096),), Id::Number(1)).unwrap();
+        let mut writing = Box::pin(transport.round_trip(request));
+        assert_pending(writing.as_mut()).await;
+
+        let mut queued_call =
+            Box::pin(transport.round_trip(br#"{"jsonrpc":"2.0","method":"next","id":2}"#.to_vec()));
+        assert_pending(queued_call.as_mut()).await;
+
+        let mut queued_notification =
+            Box::pin(transport.send_notification(br#"{"jsonrpc":"2.0","method":"next"}"#.to_vec()));
+        assert_pending(queued_notification.as_mut()).await;
+        assert_eq!(transport.pending_len(), 3);
+
+        let mut partial_frame = [0; 128];
+        server_io.read_exact(&mut partial_frame).await.unwrap();
+        drop(writing);
+        assert!(!transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert!(matches!(
+                waiting_reply.await,
+                Err(MultiplexError::ConnectionClosed)
+            ));
+            assert!(matches!(
+                queued_call.await,
+                Err(MultiplexError::ConnectionClosed)
+            ));
+            assert!(matches!(
+                queued_notification.await,
+                Err(MultiplexError::ConnectionClosed)
+            ));
+        })
+        .await
+        .expect("pending and queued sends must fail promptly");
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_notification_disconnects() {
+        let (client_io, _server_io) = tokio::io::duplex(16);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let notification =
+            crate::client::encode_notification("large", &("x".repeat(4096),)).unwrap();
+        let mut sending = Box::pin(transport.send_notification(notification));
+        assert_pending(sending.as_mut()).await;
+        drop(sending);
+
+        assert!(!transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_writer_wait_keeps_connection_usable() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let writer_lock = transport.writer.lock().await;
+        let mut queued = Box::pin(
+            transport.round_trip(br#"{"jsonrpc":"2.0","method":"first","id":100}"#.to_vec()),
+        );
+        assert_pending(queued.as_mut()).await;
+        assert_eq!(transport.pending_len(), 1);
+        drop(queued);
+        drop(writer_lock);
+
+        assert!(transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+
+        tokio::spawn(run_mock_server(server_io));
+        let client = Client::new(transport).with_request_timeout(std::time::Duration::from_secs(1));
+        assert_eq!(client.call::<_, String>("fast", ()).await.unwrap(), "fast");
+    }
+
+    #[tokio::test]
+    async fn cancelled_response_wait_keeps_connection_usable() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let mut waiting_reply = Box::pin(
+            transport.round_trip(br#"{"jsonrpc":"2.0","method":"first","id":100}"#.to_vec()),
+        );
+        assert_pending(waiting_reply.as_mut()).await;
+        drop(waiting_reply);
+
+        assert!(transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+
+        tokio::spawn(run_mock_server(server_io));
+        let client = Client::new(transport).with_request_timeout(std::time::Duration::from_secs(1));
+        assert_eq!(client.call::<_, String>("fast", ()).await.unwrap(), "fast");
     }
 
     #[tokio::test]
