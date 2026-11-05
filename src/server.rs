@@ -103,7 +103,7 @@ impl Output {
     ///
     /// Returns an internal error (`-32603`) if serialization fails.
     pub fn to_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
-        let map_err = |e: crate::json::JsonError| Error::internal_error().with_data(e.message());
+        let map_err = |e: crate::json::JsonError| Error::internal_error().with_data(e.to_string());
         match self {
             Output::Empty => Ok(None),
             Output::Single(r) => json::to_vec(r).map(Some).map_err(map_err),
@@ -148,7 +148,7 @@ where
             // DOM). Serialization failure here is a bug in the handler's
             // result type, surfaced as an internal error (-32603).
             crate::json::to_raw_value(&value)
-                .map_err(|e| Error::internal_error().with_data(e.message()))
+                .map_err(|e| Error::internal_error().with_data(e.to_string()))
         })
     }
 }
@@ -175,7 +175,7 @@ where
         Box::pin(async move {
             let value = fut.await?;
             crate::json::to_raw_value(&value)
-                .map_err(|e| Error::internal_error().with_data(e.message()))
+                .map_err(|e| Error::internal_error().with_data(e.to_string()))
         })
     }
 }
@@ -573,7 +573,9 @@ mod tests {
     fn router() -> Router<()> {
         Router::new()
             .register("subtract", |_, req: Request| async move {
-                let [a, b]: [i64; 2] = req.params_as().ok_or_else(Error::invalid_params)?;
+                let [a, b]: [i64; 2] = req
+                    .params_as()
+                    .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
                 Ok(a - b)
             })
             .register("notify", |_, _req: Request| async move {

@@ -49,14 +49,18 @@ struct EchoResult {
 fn build_router() -> Router<()> {
     Router::new()
         .register("echo", |_, req: Request| async move {
-            let p: EchoParams = req.params_as().ok_or_else(Error::invalid_params)?;
+            let p: EchoParams = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             Ok(EchoResult {
                 len: p.text.chars().count(),
                 echoed: p.text,
             })
         })
         .register("add", |_, req: Request| async move {
-            let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+            let (a, b): (i64, i64) = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             Ok(a + b)
         })
         .register("boom", |_, _req: Request| async move {

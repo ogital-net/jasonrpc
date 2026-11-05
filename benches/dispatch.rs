@@ -59,11 +59,15 @@ mod bench_impl {
     fn bench_router() -> Router<()> {
         Router::new()
             .register("add", |_, req: Request| async move {
-                let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+                let (a, b): (i64, i64) = req
+                    .params_as()
+                    .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
                 Ok(a + b)
             })
             .register("echo_point", |_, req: Request| async move {
-                let p: Point = req.params_as().ok_or_else(Error::invalid_params)?;
+                let p: Point = req
+                    .params_as()
+                    .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
                 Ok(p)
             })
             .register("noop", |_, _req: Request| async move { Ok(()) })

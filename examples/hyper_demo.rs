@@ -70,14 +70,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Positional params `[a, b]`, returning a plain `i64` directly.
         .register("add", |st: AppState, req: Request| async move {
             st.calls.fetch_add(1, Ordering::Relaxed);
-            let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+            let (a, b): (i64, i64) = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             Ok(a + b)
         })
         // Fallible method: division that rejects a zero divisor with a
         // domain-specific server error.
         .register("divide", |st: AppState, req: Request| async move {
             st.calls.fetch_add(1, Ordering::Relaxed);
-            let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+            let (a, b): (i64, i64) = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             if b == 0 {
                 return Err(Error::server_error(-32001, "division by zero"));
             }
@@ -86,7 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // By-name params returning a struct directly, reading shared state.
         .register("greet", |st: AppState, req: Request| async move {
             let n = st.calls.fetch_add(1, Ordering::Relaxed) + 1;
-            let p: GreetParams = req.params_as().ok_or_else(Error::invalid_params)?;
+            let p: GreetParams = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             let hello = if p.formal { "Good day" } else { "Hi" };
             Ok(Greeting {
                 message: format!("{hello}, {}!", p.name),

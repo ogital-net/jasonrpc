@@ -7,8 +7,8 @@
 //!
 //! All fallible functions return [`JsonError`], leaving error-code assignment
 //! to the caller. This keeps the JSON layer free of protocol semantics.
-
-use std::fmt;
+//! [`JsonError`] is the selected backend's native error type; backend-specific
+//! error APIs may differ.
 
 #[cfg(feature = "server")]
 pub(crate) struct ArrayItems<'a> {
@@ -16,41 +16,12 @@ pub(crate) struct ArrayItems<'a> {
     pub(crate) total_len: usize,
 }
 
-/// A JSON-level error: parsing or serialization failed.
-///
-/// Wraps the backend's error message. Callers decide what JSON-RPC error code
-/// (if any) to attach.
-///
-/// ```
-/// use jasonrpc::json::JsonError;
-///
-/// let err = JsonError::new("expected ident at line 1 column 2");
-/// assert!(!err.message().is_empty());
-/// ```
-#[derive(Debug, Clone)]
-pub struct JsonError(pub(crate) String);
-
-impl JsonError {
-    /// Create a `JsonError` from a message.
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-
-    /// The error message from the JSON backend.
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for JsonError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for JsonError {}
+/// The selected JSON backend's native parsing and serialization error.
+#[cfg(feature = "backend-serde-json")]
+pub use serde_json::Error as JsonError;
+/// The selected JSON backend's native parsing and serialization error.
+#[cfg(feature = "backend-sonic")]
+pub use sonic_rs::Error as JsonError;
 
 #[cfg(all(feature = "backend-serde-json", feature = "backend-sonic"))]
 compile_error!(
@@ -69,11 +40,11 @@ mod imp {
     pub use serde_json::Value;
 
     pub fn from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, JsonError> {
-        serde_json::from_slice(bytes).map_err(|e| JsonError(e.to_string()))
+        serde_json::from_slice(bytes)
     }
 
     pub fn to_vec<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, JsonError> {
-        serde_json::to_vec(v).map_err(|e| JsonError(e.to_string()))
+        serde_json::to_vec(v)
     }
 
     pub fn null() -> Value {
@@ -122,16 +93,14 @@ mod imp {
         }
 
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-        let items = deserializer
-            .deserialize_seq(ArrayVisitor { max_items })
-            .map_err(|e| JsonError(e.to_string()))?;
-        deserializer.end().map_err(|e| JsonError(e.to_string()))?;
+        let items = deserializer.deserialize_seq(ArrayVisitor { max_items })?;
+        deserializer.end()?;
         Ok(items)
     }
 
     pub fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<super::JsonRawValue, JsonError> {
-        let json = serde_json::to_string(v).map_err(|e| JsonError(e.to_string()))?;
-        serde_json::value::RawValue::from_string(json).map_err(|e| JsonError(e.to_string()))
+        let json = serde_json::to_string(v)?;
+        serde_json::value::RawValue::from_string(json)
     }
 
     /// Deserialize a `JsonRawValue` into a typed structure. Zero-copy:
@@ -140,7 +109,7 @@ mod imp {
     pub fn from_raw_value<T: serde::de::DeserializeOwned>(
         raw: &super::JsonRawValue,
     ) -> Result<T, JsonError> {
-        serde_json::from_str(raw.get()).map_err(|e| JsonError(e.to_string()))
+        serde_json::from_str(raw.get())
     }
 
     pub fn raw_value_kind(raw: &super::JsonRawValue) -> super::RawValueKind {
@@ -155,11 +124,11 @@ mod imp {
     pub use sonic_rs::Value;
 
     pub fn from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, JsonError> {
-        sonic_rs::from_slice(bytes).map_err(|e| JsonError(e.to_string()))
+        sonic_rs::from_slice(bytes)
     }
 
     pub fn to_vec<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, JsonError> {
-        sonic_rs::to_vec(v).map_err(|e| JsonError(e.to_string()))
+        sonic_rs::to_vec(v)
     }
 
     pub fn null() -> Value {
@@ -188,7 +157,7 @@ mod imp {
         let mut out = Vec::new();
         let mut total_len = 0usize;
         for item in sonic_rs::to_array_iter(bytes) {
-            let raw = item.map_err(|e| JsonError(e.to_string()))?;
+            let raw = item?;
             total_len = total_len.saturating_add(1);
             if max_items.is_none_or(|max| out.len() < max) {
                 out.push(match raw.as_raw_cow() {
@@ -204,8 +173,8 @@ mod imp {
     }
 
     pub fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<super::JsonRawValue, JsonError> {
-        let json = sonic_rs::to_vec(v).map_err(|e| JsonError(e.to_string()))?;
-        sonic_rs::from_slice::<super::JsonRawValue>(&json).map_err(|e| JsonError(e.to_string()))
+        let json = sonic_rs::to_vec(v)?;
+        sonic_rs::from_slice::<super::JsonRawValue>(&json)
     }
 
     /// Deserialize a `JsonRawValue` into a typed structure.
@@ -216,8 +185,8 @@ mod imp {
     pub fn from_raw_value<T: serde::de::DeserializeOwned>(
         raw: &super::JsonRawValue,
     ) -> Result<T, JsonError> {
-        let bytes = sonic_rs::to_vec(raw).map_err(|e| JsonError(e.to_string()))?;
-        sonic_rs::from_slice(&bytes).map_err(|e| JsonError(e.to_string()))
+        let bytes = sonic_rs::to_vec(raw)?;
+        sonic_rs::from_slice(&bytes)
     }
 
     pub fn raw_value_kind(raw: &super::JsonRawValue) -> super::RawValueKind {
@@ -295,7 +264,8 @@ pub(crate) fn from_raw_value<T: serde::de::DeserializeOwned>(
 /// assert_eq!(v, 42);
 ///
 /// let err = json::from_slice::<i64>(b"not json").unwrap_err();
-/// assert!(!err.message().is_empty());
+/// assert!(!err.to_string().is_empty());
+/// assert!(err.line() > 0);
 /// # Ok(())
 /// # }
 /// ```

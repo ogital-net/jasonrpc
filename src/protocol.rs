@@ -554,24 +554,33 @@ impl Request {
     /// Deserialize the params into a concrete type.
     ///
     /// Missing params are treated as JSON `null`, which succeeds for types
-    /// like `Option<T>`. Returns `None` if deserialization fails.
-    #[must_use]
-    pub fn params_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+    /// like `Option<T>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON backend's native [`JsonError`] if deserialization
+    /// fails, preserving its message and location information. Locations are
+    /// relative to the params JSON, not the full request body.
+    pub fn params_as<T: serde::de::DeserializeOwned>(&self) -> Result<T, JsonError> {
         match &self.params {
-            Some(raw) => crate::json::from_raw_value(raw).ok(),
-            None => crate::json::from_slice::<T>(b"null").ok(),
+            Some(raw) => crate::json::from_raw_value(raw),
+            None => crate::json::from_slice::<T>(b"null"),
         }
     }
 
     /// Deserialize a single positional parameter.
     ///
-    /// Convenience for the common single-argument method: it accepts either a
+    /// Convenience for the common single-argument method: it accepts a
     /// one-element positional array (`[value]`) and yields the inner `T`. This
     /// saves defining a newtype or matching a one-element tuple for methods
     /// like `device.get(id)`.
     ///
-    /// Returns `None` if there are no params, if the array does not hold
-    /// exactly one element, or if the element fails to deserialize into `T`.
+    /// # Errors
+    ///
+    /// Returns the JSON backend's native [`JsonError`] if there are no params,
+    /// if the array does not hold exactly one element, or if the element fails
+    /// to deserialize into `T`. Locations are relative to the params JSON,
+    /// not the full request body.
     ///
     /// ```
     /// # fn main() -> Result<(), jasonrpc::json::JsonError> {
@@ -580,12 +589,11 @@ impl Request {
     /// // `{"params": [7]}` — the usual positional form.
     /// let req: Request =
     ///     jasonrpc::json::from_slice(br#"{"jsonrpc":"2.0","method":"get","params":[7],"id":1}"#)?;
-    /// assert_eq!(req.param_as::<i64>(), Some(7));
+    /// assert_eq!(req.param_as::<i64>()?, 7);
     /// # Ok(())
     /// # }
     /// ```
-    #[must_use]
-    pub fn param_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+    pub fn param_as<T: serde::de::DeserializeOwned>(&self) -> Result<T, JsonError> {
         self.params_as::<(T,)>().map(|(value,)| value)
     }
 }
@@ -879,7 +887,7 @@ mod tests {
     fn try_constructors_succeed_on_good_types() {
         let req = Request::try_call("m", &(1, 2), Id::Number(1)).unwrap();
         assert_eq!(req.method(), "m");
-        assert_eq!(req.params_as::<(i64, i64)>(), Some((1, 2)));
+        assert_eq!(req.params_as::<(i64, i64)>().unwrap(), (1, 2));
 
         let notif = Request::try_notification("m", &[1, 2, 3]).unwrap();
         assert!(notif.is_notification());
@@ -896,7 +904,8 @@ mod tests {
     #[test]
     fn infallible_constructors_drop_on_failure() {
         let req = Request::call("m", &AlwaysFails, Id::Number(1));
-        assert!(req.params_as::<()>().is_some() || req.params_as::<i64>().is_none());
+        assert!(req.params_as::<()>().is_ok());
+        assert!(req.params_as::<i64>().is_err());
         let bytes = crate::json::to_vec(&req).unwrap();
         let s = String::from_utf8(bytes).unwrap();
         assert!(!s.contains("params"), "params should be dropped: {s}");
@@ -911,19 +920,19 @@ mod tests {
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":[7],"id":1}"#)
                 .unwrap();
-        assert_eq!(req.param_as::<i64>(), Some(7));
+        assert_eq!(req.param_as::<i64>().unwrap(), 7);
 
         // A single-element string array.
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":["hi"],"id":1}"#)
                 .unwrap();
-        assert_eq!(req.param_as::<String>(), Some("hi".to_owned()));
+        assert_eq!(req.param_as::<String>().unwrap(), "hi");
     }
 
     #[test]
     fn request_params_are_normalized_and_validated() {
         let scalar = Request::call("m", &7, Id::Number(1));
-        assert_eq!(scalar.param_as::<i64>(), Some(7));
+        assert_eq!(scalar.param_as::<i64>().unwrap(), 7);
         let bytes = crate::json::to_vec(&scalar).unwrap();
         assert!(String::from_utf8(bytes).unwrap().contains("\"params\":[7]"));
 
@@ -947,23 +956,76 @@ mod tests {
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":[1,2],"id":1}"#)
                 .unwrap();
-        assert_eq!(req.param_as::<i64>(), None);
+        assert!(req.param_as::<i64>().is_err());
 
         // Empty array.
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":[],"id":1}"#)
                 .unwrap();
-        assert_eq!(req.param_as::<i64>(), None);
+        assert!(req.param_as::<i64>().is_err());
 
         // No params at all.
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","id":1}"#).unwrap();
-        assert_eq!(req.param_as::<i64>(), None);
+        assert!(req.param_as::<i64>().is_err());
 
         // Wrong element type.
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":["x"],"id":1}"#)
                 .unwrap();
-        assert_eq!(req.param_as::<i64>(), None);
+        assert!(req.param_as::<i64>().is_err());
+    }
+
+    #[test]
+    fn params_as_preserves_missing_params_behavior() {
+        let req = Request::call("m", &(), Id::Number(1));
+        assert_eq!(req.params_as::<Option<String>>().unwrap(), None);
+        assert!(req.params_as::<()>().is_ok());
+        assert!(req.params_as::<String>().is_err());
+        assert!(req.param_as::<Option<String>>().is_err());
+
+        let req = Request::call("m", &(None::<String>,), Id::Number(1));
+        assert_eq!(req.param_as::<Option<String>>().unwrap(), None);
+    }
+
+    #[test]
+    fn params_as_preserves_native_error_details() {
+        #[derive(Debug, Deserialize)]
+        struct Device {
+            external_id: String,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            devices: Vec<Device>,
+        }
+
+        let req: Request = crate::json::from_slice(
+            br#"{"jsonrpc":"2.0","method":"m","params":{"devices":[{"external_id":"device-1"}]},"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.params_as::<Params>().unwrap().devices[0].external_id,
+            "device-1"
+        );
+
+        for params in [
+            r#"{"devices":[{"external_id":123}]}"#,
+            r#"[{"devices":[{"external_id":123}]}]"#,
+        ] {
+            let body = format!(r#"{{"jsonrpc":"2.0","method":"m","params":{params},"id":1}}"#);
+            let req: Request = crate::json::from_slice(body.as_bytes()).unwrap();
+            let error: JsonError = if params.starts_with('[') {
+                req.param_as::<Params>().unwrap_err()
+            } else {
+                req.params_as::<Params>().unwrap_err()
+            };
+            let message = error.to_string();
+            assert!(message.contains("123"), "{message}");
+            assert!(message.contains("expected a string"), "{message}");
+            assert_eq!(error.line(), 1);
+            assert!(error.column() > 0);
+            assert!(!error.is_syntax());
+        }
     }
 }

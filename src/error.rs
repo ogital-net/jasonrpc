@@ -59,10 +59,10 @@ impl From<std::io::Error> for TransportError {
 ///
 /// ```
 /// use jasonrpc::error::ClientError;
-/// use jasonrpc::json::JsonError;
+/// use jasonrpc::json;
 /// use jasonrpc::protocol::Error as RpcError;
 ///
-/// let proto = ClientError::Protocol(JsonError::new("invalid JSON"));
+/// let proto = ClientError::Protocol(json::from_slice::<()>(b"invalid JSON").unwrap_err());
 /// let rpc = ClientError::Rpc(RpcError::method_not_found());
 /// let timeout = ClientError::Timeout(std::time::Duration::from_secs(5));
 ///
@@ -126,7 +126,7 @@ mod client_error_tests {
     #[test]
     fn client_error_display_covers_all_variants() {
         let rpc = RpcError::method_not_found();
-        let json_err = crate::json::JsonError("test error".into());
+        let json_err = crate::json::from_slice::<()>(b"invalid JSON").unwrap_err();
         let transport = std::io::Error::other("io fail");
 
         assert!(ClientError::Protocol(json_err)
@@ -152,7 +152,7 @@ mod client_error_tests {
     #[test]
     fn client_error_source() {
         let rpc = RpcError::method_not_found();
-        let json_err = crate::json::JsonError("test error".into());
+        let json_err = crate::json::from_slice::<()>(b"invalid JSON").unwrap_err();
         assert!(source_of(&ClientError::Protocol(json_err)).is_some());
         assert!(source_of(&ClientError::Rpc(rpc)).is_some());
         assert!(source_of(&ClientError::IdMismatch).is_none());

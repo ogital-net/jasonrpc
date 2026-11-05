@@ -29,14 +29,18 @@ fn spec_router() -> Router<()> {
                 subtrahend: i64,
             }
             // Support both positional `[minuend, subtrahend]` and by-name.
-            if let Some((minuend, subtrahend)) = req.params_as::<(i64, i64)>() {
+            if let Ok((minuend, subtrahend)) = req.params_as::<(i64, i64)>() {
                 return Ok(minuend - subtrahend);
             }
-            let p: ByName = req.params_as().ok_or_else(Error::invalid_params)?;
+            let p: ByName = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             Ok(p.minuend - p.subtrahend)
         })
         .register("sum", |_, req: Request| async move {
-            let nums: Vec<i64> = req.params_as().ok_or_else(Error::invalid_params)?;
+            let nums: Vec<i64> = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             Ok(nums.into_iter().sum::<i64>())
         })
         .register("get_data", |_, _req: Request| async move {
@@ -95,6 +99,26 @@ async fn named_parameters() {
     .await;
     assert!(out.contains("\"result\":19"), "{out}");
     assert!(out.contains("\"id\":3"), "{out}");
+}
+
+#[tokio::test]
+async fn invalid_params_preserves_deserialization_details() {
+    let router = Router::new().register("echo", |_: (), req: Request| async move {
+        req.param_as::<String>()
+            .map_err(|error| Error::invalid_params().with_data(error.to_string()))
+    });
+    let out = call(
+        &router,
+        br#"{"jsonrpc":"2.0","method":"echo","params":[123],"id":1}"#,
+    )
+    .await;
+    let response: jasonrpc::Response = json::from_slice(out.as_bytes()).unwrap();
+    let error = response.error_obj().unwrap();
+    assert_eq!(error.code(), jasonrpc::codes::INVALID_PARAMS);
+    assert_eq!(error.message(), "Invalid params");
+    let details = error.data_as::<String>().unwrap();
+    assert!(details.contains("123"), "{details}");
+    assert!(details.contains("expected a string"), "{details}");
 }
 
 #[tokio::test]

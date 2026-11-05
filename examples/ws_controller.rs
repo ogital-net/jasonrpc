@@ -63,7 +63,9 @@ fn controller_router() -> Router<()> {
     Router::new()
         // Device connection notification (no reply).
         .register("connect", |_, req: Request| async move {
-            let c: Connect = req.params_as().ok_or_else(Error::invalid_params)?;
+            let c: Connect = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             println!(
                 "[controller] device {} connected (fw {})",
                 c.serial, c.firmware
@@ -77,7 +79,9 @@ fn controller_router() -> Router<()> {
         })
         // A keepalive the controller answers, to show request/response too.
         .register("ping", |_, req: Request| async move {
-            let p: Ping = req.params_as().ok_or_else(Error::invalid_params)?;
+            let p: Ping = req
+                .params_as()
+                .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
             println!("[controller] ping from {}", p.serial);
             Ok(PingReply {
                 serial: p.serial,

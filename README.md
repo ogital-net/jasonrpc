@@ -10,7 +10,9 @@ A transport-agnostic, spec-conforming [JSON-RPC 2.0](https://www.jsonrpc.org/spe
 # use jasonrpc::{Error, Request};
 let router = Router::new()
     .register("add", |_, req: Request| async move {
-        let (a, b): (i64, i64) = req.params_as().ok_or_else(Error::invalid_params)?;
+        let (a, b): (i64, i64) = req
+            .params_as()
+            .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
         Ok(a + b)
     });
 
@@ -72,7 +74,9 @@ let router = Router::new()
     .register("greet", |_, req: Request| async move {
         #[derive(serde::Deserialize)]
         struct Params { name: String }
-        let p: Params = req.params_as().ok_or_else(Error::invalid_params)?;
+        let p: Params = req
+            .params_as()
+            .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
         Ok(format!("hello, {}!", p.name))
     });
 
@@ -86,6 +90,20 @@ let _ = output.to_bytes();
 # #[cfg(not(feature = "server"))]
 # fn main() {}
 ```
+
+### Parameter errors
+
+`Request::params_as` and `Request::param_as` return `Result<T, json::JsonError>`,
+preserving the selected backend's error message and location information.
+Locations refer to the params JSON, not the full request body; field paths are
+not added. Missing params are still treated as JSON `null` by `params_as`, while
+`param_as` requires exactly one positional argument.
+
+The examples attach deserialization details to the JSON-RPC error's `data` field.
+Those details may include submitted values. To return only a generic error, use
+`.map_err(|_| Error::invalid_params())?` instead. Callers must inspect `error.data`
+to display the attached details; the protocol error's `Display` shows only its
+message and code.
 
 ### Client
 
@@ -144,7 +162,8 @@ jasonrpc = "0.6"
 jasonrpc = { version = "0.6", default-features = false, features = ["backend-sonic"] }
 ```
 
-The public API is backend-neutral -- user code never sees `serde_json::Value` or `sonic_rs::Value` directly.
+Use `json::Value` and `json::JsonError` to refer to the selected backend's native
+types. Backend-specific methods may differ.
 
 ## Examples
 
