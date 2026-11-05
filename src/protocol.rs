@@ -641,14 +641,15 @@ impl Response {
     /// construction time.
     ///
     /// If serialization fails the response is constructed with a `null` result.
-    /// For `#[derive(Serialize)]` types this never happens; use
-    /// [`try_result`](Self::try_result) if `value` can genuinely fail to
-    /// serialize and you want the error rather than a silent `null`.
+    /// Use [`try_result`](Self::try_result) to receive the serialization error
+    /// instead of a silent `null`.
     #[must_use]
     pub fn result(id: Id, value: impl Serialize) -> Self {
+        let result = crate::json::to_raw_value(&value)
+            .unwrap_or_else(|_| crate::json::to_raw_value(&()).expect("null is valid JSON"));
         Self {
             jsonrpc: Version,
-            result: crate::json::to_raw_value(&value).ok(),
+            result: Some(result),
             error: None,
             id,
         }
@@ -910,6 +911,31 @@ mod tests {
         assert!(Request::try_notification("m", &AlwaysFails).is_err());
         assert!(Response::try_result(Id::Number(1), AlwaysFails).is_err());
         assert!(Error::new(-32000, "x").try_with_data(AlwaysFails).is_err());
+    }
+
+    #[test]
+    fn response_result_falls_back_to_null_on_serialization_failure() {
+        #[derive(Serialize)]
+        struct Payload {
+            value: AlwaysFails,
+        }
+
+        for response in [
+            Response::result(Id::Number(1), AlwaysFails),
+            Response::result(Id::Number(1), Payload { value: AlwaysFails }),
+        ] {
+            assert!(response.is_valid());
+            assert!(!response.is_error());
+            assert_eq!(response.id(), &Id::Number(1));
+            assert_eq!(response.result_as::<()>(), Some(()));
+            assert_eq!(response.result_as::<Option<String>>(), Some(None));
+
+            let bytes = crate::json::to_vec(&response).unwrap();
+            assert_eq!(bytes, br#"{"jsonrpc":"2.0","result":null,"id":1}"#);
+            let parsed: Response = crate::json::from_slice(&bytes).unwrap();
+            assert!(parsed.is_valid());
+            assert_eq!(parsed.result_as::<()>(), Some(()));
+        }
     }
 
     #[test]
