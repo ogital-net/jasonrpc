@@ -145,11 +145,21 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
+struct ReaderTaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ReaderTaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A multiplexing transport over a single shared, framed connection.
 ///
 /// Cheap to clone: clones share the same underlying connection, writer lock,
 /// and pending map. Build one with [`MultiplexTransport::new`] and hand clones
 /// to as many concurrent callers as you like.
+/// Dropping the last transport handle aborts the reader task and closes the
+/// connection.
 ///
 /// Cancelling an in-progress frame write invalidates the connection and fails
 /// all pending calls with [`MultiplexError::ConnectionClosed`]. Cancelling while
@@ -157,6 +167,7 @@ impl Drop for WriteGuard<'_> {
 pub struct MultiplexTransport<W, F> {
     writer: Arc<AsyncMutex<FramedWriter<W, F>>>,
     state: SharedState,
+    reader_task: Arc<ReaderTaskGuard>,
 }
 
 impl<W, F> std::fmt::Debug for MultiplexTransport<W, F> {
@@ -172,6 +183,7 @@ impl<W, F> Clone for MultiplexTransport<W, F> {
         Self {
             writer: Arc::clone(&self.writer),
             state: Arc::clone(&self.state),
+            reader_task: Arc::clone(&self.reader_task),
         }
     }
 }
@@ -190,8 +202,9 @@ where
     ///
     /// Splits the stream into read/write halves, spawns the background reader,
     /// and returns the cloneable transport. The reader task lives until the
-    /// connection ends (EOF or error), at which point all pending and future
-    /// calls fail with [`MultiplexError::ConnectionClosed`].
+    /// connection ends (EOF or error) or the last transport handle is dropped.
+    /// When the connection ends, all pending and future calls fail with
+    /// [`MultiplexError::ConnectionClosed`].
     pub fn new(stream: S, framing: F) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
         let state = Arc::new(Mutex::new(ConnectionState {
@@ -206,9 +219,16 @@ where
 
         // Spawn the reader task: decode frames, route by id.
         let reader = FramedReader::new(read_half, framing);
-        tokio::spawn(reader_loop(reader, Arc::clone(&state)));
+        let reader_task = Arc::new(ReaderTaskGuard(tokio::spawn(reader_loop(
+            reader,
+            Arc::clone(&state),
+        ))));
 
-        MultiplexTransport { writer, state }
+        MultiplexTransport {
+            writer,
+            state,
+            reader_task,
+        }
     }
 }
 
@@ -428,6 +448,52 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_last_transport_closes_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let (client_io, mut server_io) = tokio::io::duplex(64);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let state = Arc::downgrade(&transport.state);
+        drop(transport);
+
+        let mut byte = [0; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(1), server_io.read(&mut byte))
+                .await
+                .expect("dropping the last transport must close the peer connection")
+                .unwrap();
+        assert_eq!(read, 0);
+        assert!(state.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_one_clone_keeps_connection_usable() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let server = tokio::spawn(run_mock_server(server_io));
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let state = Arc::downgrade(&transport.state);
+        let client =
+            Client::new(transport.clone()).with_request_timeout(std::time::Duration::from_secs(1));
+
+        assert_eq!(
+            client.call::<_, String>("before", ()).await.unwrap(),
+            "before"
+        );
+        drop(transport);
+        assert_eq!(
+            client.call::<_, String>("after", ()).await.unwrap(),
+            "after"
+        );
+        drop(client);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("dropping the last client must close its connection")
+            .unwrap();
+        assert!(state.upgrade().is_none());
     }
 
     #[tokio::test]
