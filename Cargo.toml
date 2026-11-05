@@ -114,7 +114,7 @@ criterion = "0.5"
 
 [[example]]
 name = "hyper_demo"
-required-features = ["hyper", "http-client"]
+required-features = ["hyper", "http-client", "tokio"]
 
 [[example]]
 name = "oauth_client_credentials"

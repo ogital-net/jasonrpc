@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example hyper_demo --features "hyper,http-client"
+//! cargo run --example hyper_demo --features "hyper,http-client,tokio"
 //! ```
 //!
 //! This spins up a `jasonrpc` server on a hyper connection, then drives it with

@@ -169,7 +169,7 @@ types. Backend-specific methods may differ.
 
 ```sh
 # HTTP client + server
-cargo run --example hyper_demo --features "hyper,http-client"
+cargo run --example hyper_demo --features "hyper,http-client,tokio"
 
 # Raw UDS, netstring-framed
 cargo run --example uds_demo --features "server,client,netstring,tokio"
