@@ -387,6 +387,31 @@ mod tests {
     }
 
     #[test]
+    fn decode_null_result() {
+        for bytes in [
+            br#"{"jsonrpc":"2.0","result":null,"id":1}"#.to_vec(),
+            json::to_vec(&Response::result(Id::Number(1), ())).unwrap(),
+            json::to_vec(&Response::result(Id::Number(1), None::<String>)).unwrap(),
+        ] {
+            assert!(decode_result::<()>(&bytes, &Id::Number(1)).is_ok());
+            assert_eq!(
+                decode_result::<Option<String>>(&bytes, &Id::Number(1)).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_null_result_with_error() {
+        let bytes = br#"{"jsonrpc":"2.0","result":null,"error":{"code":-32601,"message":"Method not found"},"id":1}"#;
+        let error = decode_result::<()>(bytes, &Id::Number(1)).unwrap_err();
+        assert!(
+            matches!(error, ClientError::MalformedResponse),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
     fn id_gen_uses_unsigned_ids_across_signed_boundary() {
         let ids = IdGen {
             next: AtomicU64::new(i64::MAX as u64),

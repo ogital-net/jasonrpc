@@ -219,6 +219,10 @@ fn de_present_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Id>, D::Error
     Ok(Some(Id::deserialize(d)?))
 }
 
+fn de_result<'de, D: Deserializer<'de>>(d: D) -> Result<Option<JsonRawValue>, D::Error> {
+    JsonRawValue::deserialize(d).map(Some)
+}
+
 fn de_params<'de, D: Deserializer<'de>>(d: D) -> Result<Option<JsonRawValue>, D::Error> {
     let raw = JsonRawValue::deserialize(d)?;
     match crate::json::raw_value_kind(&raw) {
@@ -621,7 +625,11 @@ impl Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Response {
     jsonrpc: Version,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "de_result"
+    )]
     result: Option<JsonRawValue>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     error: Option<Error>,
@@ -841,6 +849,27 @@ mod tests {
         let err = String::from_utf8(err).unwrap();
         assert!(err.contains("\"error\"") && !err.contains("\"result\""));
         assert!(err.contains("\"id\":null"));
+    }
+
+    #[test]
+    fn response_null_result_round_trips() {
+        let bytes = br#"{"jsonrpc":"2.0","result":null,"id":1}"#;
+        let response: Response = crate::json::from_slice(bytes).unwrap();
+        assert!(response.is_valid());
+        assert!(!response.is_error());
+        assert!(response.result_raw().is_some());
+        assert_eq!(response.result_as::<()>(), Some(()));
+        assert_eq!(response.result_as::<Option<String>>(), Some(None));
+        assert_eq!(crate::json::to_vec(&response).unwrap(), bytes);
+    }
+
+    #[test]
+    fn response_missing_result_stays_absent() {
+        let bytes = br#"{"jsonrpc":"2.0","id":1}"#;
+        let response: Response = crate::json::from_slice(bytes).unwrap();
+        assert!(!response.is_valid());
+        assert!(response.result_raw().is_none());
+        assert_eq!(crate::json::to_vec(&response).unwrap(), bytes);
     }
 
     #[test]
