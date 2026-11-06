@@ -42,9 +42,14 @@ use crate::transport::Framing;
 /// [`base_backoff`](RetryPolicy::base_backoff) and doubling up to
 /// [`max_backoff`](RetryPolicy::max_backoff). If every attempt fails, the call
 /// that triggered the reconnect surfaces the connection error.
+///
+/// Set [`max_attempts`](RetryPolicy::max_attempts) to zero, or use
+/// [`RetryPolicy::none`], to disable reconnection. The initial connection is
+/// always attempted once, regardless of this policy.
 #[derive(Clone, Debug)]
 pub struct RetryPolicy {
-    /// Maximum number of dial attempts before giving up. Must be at least 1.
+    /// Maximum number of reconnect dial attempts before giving up. Zero disables
+    /// reconnection without affecting the initial connection attempt.
     pub max_attempts: u32,
     /// Delay before the second attempt; doubles each subsequent attempt.
     pub base_backoff: Duration,
@@ -63,12 +68,12 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// A policy that never reconnects: a single dial attempt, and once the
-    /// connection dies it stays dead (matching the pre-reconnection behavior).
+    /// A policy that never reconnects: the initial connection is attempted once,
+    /// and once it dies it stays dead (matching the pre-reconnection behavior).
     #[must_use]
     pub fn none() -> Self {
         Self {
-            max_attempts: 1,
+            max_attempts: 0,
             base_backoff: Duration::ZERO,
             max_backoff: Duration::ZERO,
         }
@@ -156,7 +161,7 @@ where
         let mut backoff = self.policy.base_backoff;
         let mut last_err: Option<std::io::Error> = None;
 
-        for attempt in 0..self.policy.max_attempts.max(1) {
+        for attempt in 0..self.policy.max_attempts {
             if attempt > 0 {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(self.policy.max_backoff);
@@ -411,6 +416,70 @@ mod tests {
 
         server2.abort();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test]
+    async fn reconnection_policy_controls_restart_recovery() {
+        use crate::error::ClientError;
+
+        for (policy, should_reconnect) in [
+            (RetryPolicy::none(), false),
+            (
+                RetryPolicy {
+                    max_attempts: 0,
+                    ..RetryPolicy::default()
+                },
+                false,
+            ),
+            (
+                RetryPolicy {
+                    max_attempts: 1,
+                    ..RetryPolicy::none()
+                },
+                true,
+            ),
+        ] {
+            let sock = unique_sock();
+            let server = serve_at(sock.clone());
+            let transport = ReconnectingUds::connect(&sock, Netstring, policy)
+                .await
+                .unwrap();
+            let client =
+                Client::new(transport.clone()).with_request_timeout(Duration::from_secs(1));
+            assert_eq!(client.call::<_, i64>("add", (1, 2)).await.unwrap(), 3);
+
+            server.abort();
+            let _ = server.await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while transport.snapshot().is_connected() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the reader must observe the closed connection");
+
+            let restarted = serve_at(sock.clone());
+            let call = client.call::<_, i64>("add", (10, 20)).await;
+            let notification = client.notify("update", ()).await;
+            restarted.abort();
+            let _ = restarted.await;
+            let _ = std::fs::remove_file(&sock);
+
+            if should_reconnect {
+                assert_eq!(call.unwrap(), 30);
+                notification.unwrap();
+            } else {
+                for result in [call.map(|_| ()), notification] {
+                    let ClientError::Transport(error) = result.unwrap_err() else {
+                        panic!("expected a disconnected transport error");
+                    };
+                    assert!(matches!(
+                        error.downcast_ref::<MultiplexError>(),
+                        Some(MultiplexError::ConnectionClosed)
+                    ));
+                }
+            }
+        }
     }
 
     #[tokio::test]
