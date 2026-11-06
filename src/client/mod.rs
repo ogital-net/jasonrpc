@@ -109,7 +109,8 @@ pub fn encode_notification<P: serde::Serialize>(
 /// # Errors
 ///
 /// Returns a [`ClientError`] if:
-/// - The response is not valid JSON ([`ClientError::Protocol`])
+/// - The response cannot be deserialized, including an explicit `error: null`
+///   ([`ClientError::Protocol`])
 /// - The response id does not match `expected` ([`ClientError::IdMismatch`])
 /// - The response contains a JSON-RPC error object ([`ClientError::Rpc`])
 /// - The response has neither/both of `result` and `error`
@@ -409,6 +410,19 @@ mod tests {
             matches!(error, ClientError::MalformedResponse),
             "got {error:?}"
         );
+    }
+
+    #[test]
+    fn decode_rejects_explicit_null_error() {
+        for bytes in [
+            br#"{"jsonrpc":"2.0","result":42,"error":null,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":null,"result":42,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","result":null,"error":null,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":null,"id":1}"#.as_slice(),
+        ] {
+            let error = decode_result::<Option<i64>>(bytes, &Id::Number(1)).unwrap_err();
+            assert!(matches!(error, ClientError::Protocol(_)), "got {error:?}");
+        }
     }
 
     #[test]

@@ -223,6 +223,10 @@ fn de_result<'de, D: Deserializer<'de>>(d: D) -> Result<Option<JsonRawValue>, D:
     JsonRawValue::deserialize(d).map(Some)
 }
 
+fn de_error<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Error>, D::Error> {
+    Error::deserialize(d).map(Some)
+}
+
 fn de_params<'de, D: Deserializer<'de>>(d: D) -> Result<Option<JsonRawValue>, D::Error> {
     let raw = JsonRawValue::deserialize(d)?;
     match crate::json::raw_value_kind(&raw) {
@@ -635,7 +639,8 @@ impl Request {
 ///
 /// Exactly one of `result` / `error` is populated. Use [`Response::result`] and
 /// [`Response::error`] to construct valid responses; the constructors guarantee
-/// the invariant.
+/// the invariant. An explicit `error: null` is rejected during deserialization
+/// rather than treated as an absent field.
 ///
 /// ```
 /// # fn main() -> Result<(), jasonrpc::json::JsonError> {
@@ -660,7 +665,11 @@ pub struct Response {
         deserialize_with = "de_result"
     )]
     result: Option<JsonRawValue>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "de_error"
+    )]
     error: Option<Error>,
     id: Id,
 }
@@ -910,6 +919,22 @@ mod tests {
         assert_eq!(response.result_as::<()>(), Some(()));
         assert_eq!(response.result_as::<Option<String>>(), Some(None));
         assert_eq!(crate::json::to_vec(&response).unwrap(), bytes);
+    }
+
+    #[test]
+    fn response_rejects_explicit_null_error() {
+        for input in [
+            br#"{"jsonrpc":"2.0","result":42,"error":null,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":null,"result":42,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","result":null,"error":null,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":null,"id":1}"#.as_slice(),
+        ] {
+            assert!(
+                crate::json::from_slice::<Response>(input).is_err(),
+                "accepted null error: {}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[test]
