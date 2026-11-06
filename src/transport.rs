@@ -514,6 +514,12 @@ pub mod io {
             F: Framing,
         {
             loop {
+                if self.max_frame_size > 0 && self.read_buf.len() > self.max_frame_size {
+                    return Err(TransportError::Frame(format!(
+                        "frame exceeds max size of {} bytes",
+                        self.max_frame_size
+                    )));
+                }
                 if let Some((msg, consumed)) =
                     framing.decode_from(&self.read_buf, self.decode_offset)?
                 {
@@ -523,7 +529,7 @@ pub mod io {
                 }
                 self.decode_offset = self.read_buf.len();
 
-                let n = self.fill(inner).await?;
+                let n = self.fill(inner, framing.take_on_eof()).await?;
                 if n == 0 {
                     self.decode_offset = 0;
                     return if framing.take_on_eof() {
@@ -544,12 +550,16 @@ pub mod io {
         /// Read one chunk directly into the tail of `read_buf` (no intermediate
         /// stack buffer or extra copy), enforcing the frame-size cap. Returns
         /// the number of bytes read (`0` = EOF).
-        async fn fill<R>(&mut self, inner: &mut R) -> Result<usize, TransportError>
+        async fn fill<R>(
+            &mut self,
+            inner: &mut R,
+            take_on_eof: bool,
+        ) -> Result<usize, TransportError>
         where
             R: AsyncRead + Unpin,
         {
             let start = self.read_buf.len();
-            if self.max_frame_size > 0 && start >= self.max_frame_size {
+            if self.max_frame_size > 0 && start >= self.max_frame_size && !take_on_eof {
                 return Err(TransportError::Frame(format!(
                     "frame exceeds max size of {} bytes",
                     self.max_frame_size
@@ -557,7 +567,7 @@ pub mod io {
             }
 
             let read_len = if self.max_frame_size > 0 {
-                CHUNK_SIZE.min(self.max_frame_size - start)
+                CHUNK_SIZE.min((self.max_frame_size - start).max(1))
             } else {
                 CHUNK_SIZE
             };
@@ -1245,17 +1255,108 @@ mod framed_io_tests {
     }
 
     #[tokio::test]
+    async fn max_frame_size_allows_eof_at_cap() {
+        use io::{FramedConn, FramedReader};
+        use std::io::Cursor;
+        use tokio::io::AsyncWriteExt;
+
+        for limit in [1, 4096, 4097] {
+            let payload = vec![b'x'; limit];
+            let mut reader =
+                FramedReader::new(Cursor::new(&payload), Newline).with_max_frame_size(limit);
+            assert_eq!(reader.recv().await.unwrap(), Some(payload.clone()));
+            assert_eq!(reader.recv().await.unwrap(), None);
+
+            let (stream, mut peer) = tokio::io::duplex(limit + 1);
+            peer.write_all(&payload).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut connection = FramedConn::new(stream, Newline).with_max_frame_size(limit);
+            assert_eq!(connection.recv().await.unwrap(), Some(payload));
+            assert_eq!(connection.recv().await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
     async fn max_frame_size_rejects_oversized() {
+        use io::{FramedConn, FramedReader};
+        use std::io::Cursor;
+        use tokio::io::AsyncWriteExt;
+
+        for limit in [1, 50, 4096, 4097] {
+            for suffix in [b"x".as_slice(), b"\n".as_slice(), b"extra bytes".as_slice()] {
+                let mut data = vec![b'x'; limit];
+                data.extend_from_slice(suffix);
+                let mut reader =
+                    FramedReader::new(Cursor::new(&data), Newline).with_max_frame_size(limit);
+                let (stream, mut peer) = tokio::io::duplex(data.len());
+                peer.write_all(&data).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut connection = FramedConn::new(stream, Newline).with_max_frame_size(limit);
+
+                for _ in 0..2 {
+                    let error = reader.recv().await.unwrap_err();
+                    assert!(
+                        matches!(error, TransportError::Frame(ref message) if message.contains("exceeds max size")),
+                        "expected size error, got {error:?}"
+                    );
+                    let error = connection.recv().await.unwrap_err();
+                    assert!(
+                        matches!(error, TransportError::Frame(ref message) if message.contains("exceeds max size")),
+                        "expected size error, got {error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_at_cap_preserves_buffer_after_cancellation_and_timeout() {
+        use io::{FramedConn, FramedReader};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        for delimiter in *b"\n\0" {
+            let (read_half, mut write_half) = tokio::io::duplex(64);
+            let mut reader = FramedReader::new(read_half, Delimited::new(delimiter))
+                .with_max_frame_size(2)
+                .with_read_timeout(Duration::from_millis(10));
+            write_half.write_all(b"{}").await.unwrap();
+            cancel_pending(reader.recv()).await;
+            let error = reader.recv().await.unwrap_err();
+            assert!(
+                matches!(error, TransportError::Frame(ref message) if message.contains("timed out"))
+            );
+            write_half.shutdown().await.unwrap();
+            assert_eq!(reader.recv().await.unwrap(), Some(b"{}".to_vec()));
+            assert_eq!(reader.recv().await.unwrap(), None);
+
+            let (stream, mut peer) = tokio::io::duplex(64);
+            let mut connection = FramedConn::new(stream, Delimited::new(delimiter))
+                .with_max_frame_size(2)
+                .with_read_timeout(Duration::from_millis(10));
+            peer.write_all(b"{}").await.unwrap();
+            cancel_pending(connection.recv()).await;
+            let error = connection.recv().await.unwrap_err();
+            assert!(
+                matches!(error, TransportError::Frame(ref message) if message.contains("timed out"))
+            );
+            peer.shutdown().await.unwrap();
+            assert_eq!(connection.recv().await.unwrap(), Some(b"{}".to_vec()));
+            assert_eq!(connection.recv().await.unwrap(), None);
+        }
+    }
+
+    #[cfg(feature = "netstring")]
+    #[tokio::test]
+    async fn max_frame_size_keeps_non_eof_framing_strict() {
         use io::FramedReader;
         use std::io::Cursor;
 
-        // 100 bytes of 'x' — exceeds the 50 byte limit.
-        let data: Vec<u8> = (0..100).map(|_| b'x').collect();
-        let mut reader = FramedReader::new(Cursor::new(data), Newline).with_max_frame_size(50);
-        let err = reader.recv().await.unwrap_err();
+        let mut reader = FramedReader::new(Cursor::new(b"1:x"), Netstring).with_max_frame_size(3);
+        let error = reader.recv().await.unwrap_err();
         assert!(
-            matches!(err, TransportError::Frame(ref m) if m.contains("exceeds max size")),
-            "expected size error, got {err:?}"
+            matches!(error, TransportError::Frame(ref message) if message.contains("exceeds max size")),
+            "expected size error, got {error:?}"
         );
     }
 
