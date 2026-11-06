@@ -161,6 +161,11 @@ mod client_error_tests {
         let io = std::io::Error::other("io");
         assert!(source_of(&ClientError::Transport(Box::new(io))).is_some());
     }
+}
+
+#[cfg(all(test, feature = "transport"))]
+mod transport_error_tests {
+    use super::*;
 
     #[test]
     fn transport_error_display() {

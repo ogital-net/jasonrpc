@@ -172,10 +172,10 @@ types. Backend-specific methods may differ.
 cargo run --example hyper_demo --features "hyper,http-client,tokio"
 
 # Raw UDS, netstring-framed
-cargo run --example uds_demo --features "server,client,netstring,tokio"
+cargo run --example uds_demo --features "server,client,uds,netstring,tokio"
 
 # HTTP front door -> multiplexed UDS upstream, with id rewriting
-cargo run --example gateway_demo --features "server,http-client,hyper,netstring,tokio"
+cargo run --example gateway_demo --features "server,http-client,hyper,uds,netstring,tokio"
 
 # JSON-RPC over WebSocket: a server dispatching messages from WS clients
 cargo run --example ws_controller --features "server,websocket,tokio,hyper"

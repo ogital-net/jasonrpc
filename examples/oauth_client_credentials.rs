@@ -125,7 +125,7 @@ impl ClientCredentials {
             return Err(format!("token endpoint returned {}", resp.status()).into());
         }
         let body = resp.into_body().collect().await?.to_bytes();
-        Ok(serde_json::from_slice(&body)?)
+        Ok(jasonrpc::json::from_slice(&body)?)
     }
 }
 

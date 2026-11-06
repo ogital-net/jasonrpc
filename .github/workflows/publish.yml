@@ -37,13 +37,13 @@ jobs:
       - name: Test (serde_json backend, full feature set)
         run: >
           cargo test
-          --features "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+          --features "server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"
           --verbose
 
       - name: Test (sonic backend)
         run: >
           cargo test --no-default-features
-          --features "backend-sonic,server,client,transport,netstring,newline,tokio"
+          --features "backend-sonic,server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"
           --verbose
 
       - name: Spec conformance (serde_json)
@@ -57,7 +57,7 @@ jobs:
       - name: Doc tests
         run: >
           cargo test --doc
-          --features "server,client,transport,netstring,newline,tokio,hyper,tower,http-client"
+          --features "server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"
 
       - name: Dry-run package
         run: cargo package --verbose

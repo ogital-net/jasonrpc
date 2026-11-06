@@ -11,9 +11,8 @@ env:
   RUSTFLAGS: "-D warnings"
 
 # The two backends are mutually exclusive (a compile_error! enforces this), so
-# we can never use --all-features. The matrix below runs every meaningful
-# combination: default backend + full integration stack, and sonic backend +
-# transport/server/client stack.
+# we can never use --all-features. The matrix below runs the full integration
+# stack under each backend. Smaller feature sets are tested separately.
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -35,14 +34,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        label: [serde_json, sonic]
         include:
           # serde_json backend with all integrations
           - label: serde_json
             features: "server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"
             extra_flags: ""
-          # sonic-rs backend — integrations that don't require hyper
+          # sonic-rs backend with all integrations
           - label: sonic
-            features: "backend-sonic,server,client,transport,netstring,newline,content-length,tokio,uds,websocket"
+            features: "backend-sonic,server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"
             extra_flags: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
@@ -64,12 +64,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        label: [serde_json, sonic]
         include:
           - label: serde_json
             features: "server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"
             extra_flags: ""
           - label: sonic
-            features: "backend-sonic,server,client,transport,netstring,newline,content-length,tokio,uds,websocket"
+            features: "backend-sonic,server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"
             extra_flags: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +80,28 @@ jobs:
           cargo test
           ${{ matrix.extra_flags }}
           --features "${{ matrix.features }}"
+
+  # ---------------------------------------------------------------------------
+  # Test individual features and the client/transport boundaries so the full
+  # integration stack cannot mask missing feature gates.
+  test-feature-subsets:
+    name: test (feature subsets / ${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [backend-serde-json, backend-sonic]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          for features in "" server client transport tokio client,transport client,tokio \
+            netstring newline content-length uds hyper tower websocket http-client; do
+            echo "::group::Features: ${{ matrix.backend }}${features:+,$features}"
+            cargo test --no-default-features --features "${{ matrix.backend }}${features:+,$features}"
+            echo "::endgroup::"
+          done
 
   # ---------------------------------------------------------------------------
   # Spec-conformance golden tests driven under each backend independently.

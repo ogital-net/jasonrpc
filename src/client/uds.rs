@@ -219,6 +219,7 @@ where
 /// [`ReconnectingUds`] for the exact recovery semantics.
 ///
 /// ```no_run
+/// # #[cfg(feature = "netstring")]
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// use jasonrpc::client::UdsClient;
 /// use jasonrpc::transport::Netstring;
@@ -252,6 +253,7 @@ where
     /// socket cannot be reached for the initial connection.
     ///
     /// ```no_run
+    /// # #[cfg(feature = "netstring")]
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// use std::time::Duration;
     /// use jasonrpc::client::UdsClient;

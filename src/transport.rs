@@ -421,6 +421,8 @@ fn split_crlf(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// `tokio_util`'s `CancellationToken` — so no extra dependency is required.
 ///
 /// ```no_run
+/// # #[cfg(all(feature = "server", unix))]
+/// # mod example {
 /// use std::sync::Arc;
 /// use tokio::net::UnixListener;
 /// use tokio::task::JoinSet;
@@ -447,6 +449,7 @@ fn split_crlf(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
 ///
 /// // Drain: let in-flight connections finish their current work.
 /// while conns.join_next().await.is_some() {}
+/// # }
 /// # }
 /// ```
 ///

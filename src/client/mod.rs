@@ -526,6 +526,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn client_timeout_on_call() {
         // A transport that never responds.
@@ -542,6 +543,7 @@ mod tests {
         assert!(matches!(err, ClientError::Timeout(_)), "got {err:?}");
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn client_timeout_on_round_trip_raw() {
         struct Hangs;
@@ -557,6 +559,7 @@ mod tests {
         assert!(matches!(err, ClientError::Timeout(_)), "got {err:?}");
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn client_timeout_on_notify() {
         use std::marker::PhantomData;
