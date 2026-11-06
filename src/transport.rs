@@ -34,6 +34,7 @@ use crate::error::TransportError;
 /// anything else. I/O drivers live alongside under the `tokio` feature.
 ///
 /// ```
+/// # #[cfg(feature = "newline")] {
 /// use jasonrpc::transport::{Framing, Newline};
 ///
 /// let f = Newline;
@@ -47,6 +48,7 @@ use crate::error::TransportError;
 /// let (msg, consumed) = f.decode(&buf).unwrap().unwrap();
 /// assert_eq!(msg, b"hello");
 /// assert_eq!(consumed, 6); // "hello\n" = 6 bytes consumed
+/// # }
 /// ```
 pub trait Framing {
     /// Encode one message payload into `dst`, adding whatever framing overhead
