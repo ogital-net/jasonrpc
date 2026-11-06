@@ -66,6 +66,29 @@ pub trait Framing {
     /// Returns a [`TransportError`] if the framing is malformed.
     fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError>;
 
+    /// Decode after an earlier attempt needed more bytes.
+    ///
+    /// `offset` is the length of an unchanged prefix previously passed to this
+    /// codec that returned `Ok(None)`. Pass 0 for a new frame. The returned
+    /// payload and consumed count are relative to all of `src`, not its suffix.
+    /// The default retries [`decode`](Self::decode); codecs may override this
+    /// to avoid rescanning the prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TransportError`] if the framing is malformed.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic if `offset` exceeds `src.len()`.
+    fn decode_from(
+        &self,
+        src: &[u8],
+        _offset: usize,
+    ) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+        self.decode(src)
+    }
+
     /// When `true`, the I/O driver treats EOF as a valid frame boundary:
     /// whatever is buffered becomes the next message. This supports clients
     /// that delimit requests by half-closing the connection (`shutdown SHUT_WR`)
@@ -132,7 +155,16 @@ impl Framing for Delimited {
     }
 
     fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
-        if let Some(idx) = memchr::memchr(self.0, src) {
+        self.decode_from(src, 0)
+    }
+
+    fn decode_from(
+        &self,
+        src: &[u8],
+        offset: usize,
+    ) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+        if let Some(relative) = memchr::memchr(self.0, &src[offset..]) {
+            let idx = offset + relative;
             Ok(Some((src[..idx].to_vec(), idx + 1)))
         } else {
             Ok(None)
@@ -163,6 +195,14 @@ impl Framing for Newline {
 
     fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
         Delimited(b'\n').decode(src)
+    }
+
+    fn decode_from(
+        &self,
+        src: &[u8],
+        offset: usize,
+    ) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+        Delimited(b'\n').decode_from(src, offset)
     }
 
     fn take_on_eof(&self) -> bool {
@@ -437,6 +477,7 @@ pub mod io {
     /// behavior rather than duplicating it.
     struct ReadCore {
         read_buf: Vec<u8>,
+        decode_offset: usize,
         read_timeout: Option<Duration>,
         max_frame_size: usize,
     }
@@ -456,6 +497,7 @@ pub mod io {
         fn new() -> Self {
             Self {
                 read_buf: Vec::with_capacity(CHUNK_SIZE),
+                decode_offset: 0,
                 read_timeout: None,
                 max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             }
@@ -472,13 +514,18 @@ pub mod io {
             F: Framing,
         {
             loop {
-                if let Some((msg, consumed)) = framing.decode(&self.read_buf)? {
+                if let Some((msg, consumed)) =
+                    framing.decode_from(&self.read_buf, self.decode_offset)?
+                {
                     self.read_buf.drain(..consumed);
+                    self.decode_offset = 0;
                     return Ok(Some(msg));
                 }
+                self.decode_offset = self.read_buf.len();
 
                 let n = self.fill(inner).await?;
                 if n == 0 {
+                    self.decode_offset = 0;
                     return if framing.take_on_eof() {
                         if self.read_buf.is_empty() {
                             Ok(None)
@@ -933,6 +980,61 @@ mod newline_framed_io_tests {
     use super::*;
     use io::FramedReader;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn reader_scans_each_byte_once_across_chunked_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingNewline<'a>(&'a AtomicUsize);
+
+        impl Framing for CountingNewline<'_> {
+            fn encode(&self, payload: &[u8], dst: &mut Vec<u8>) {
+                Newline.encode(payload, dst);
+            }
+
+            fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+                self.0.fetch_add(src.len(), Ordering::Relaxed);
+                Newline.decode(src)
+            }
+
+            fn decode_from(
+                &self,
+                src: &[u8],
+                offset: usize,
+            ) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+                self.0.fetch_add(src.len() - offset, Ordering::Relaxed);
+                Newline.decode_from(src, offset)
+            }
+        }
+
+        let payload = vec![b'x'; 16 * 1024];
+        let mut data = Vec::new();
+        Newline.encode(&payload, &mut data);
+        let frame_len = data.len();
+        let scanned = AtomicUsize::new(0);
+        let mut reader = FramedReader::new(Cursor::new(data), CountingNewline(&scanned));
+
+        assert_eq!(reader.recv().await.unwrap(), Some(payload));
+        assert_eq!(scanned.load(Ordering::Relaxed), frame_len);
+        assert_eq!(reader.recv().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn delimited_reader_resets_scan_offset_between_frames_and_eof() {
+        let first = vec![b'x'; 8192];
+        let second = vec![b'y'; 4096];
+        let framing = Delimited::new(b'\0');
+        let mut data = Vec::new();
+        framing.encode(&first, &mut data);
+        framing.encode(&second, &mut data);
+        data.extend_from_slice(b"last");
+        let mut reader = FramedReader::new(Cursor::new(data), framing);
+
+        assert_eq!(reader.recv().await.unwrap(), Some(first));
+        assert_eq!(reader.recv().await.unwrap(), Some(second));
+        assert_eq!(reader.recv().await.unwrap(), Some(b"last".to_vec()));
+        assert_eq!(reader.recv().await.unwrap(), None);
+    }
 
     #[tokio::test]
     async fn reader_delivers_on_eof_without_newline() {

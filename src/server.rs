@@ -118,6 +118,11 @@ impl Output {
 /// (serialized exactly once), or a protocol [`Error`].
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<JsonRawValue, Error>> + Send>>;
 
+/// A boxed future that completes after a notification handler finishes.
+///
+/// Notification results and errors are discarded without producing a response.
+pub type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// A registered method handler.
 ///
 /// Receives the shared state and the parsed [`Request`], and resolves to either
@@ -126,12 +131,23 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<JsonRawValue, Error>
 ///
 /// This trait is rarely implemented directly: any async closure
 /// `Fn(S, Request) -> impl Future<Output = Result<T, Error>>` where `T:
-/// Serialize` is a handler. The result is serialized on return, so a handler
+/// Serialize` is a handler. Call results are serialized on return, so a handler
 /// may return an `i64`, a `String`, a `#[derive(Serialize)]` struct, or a
-/// [`Value`] directly.
+/// [`Value`] directly. Notification results are dropped without serialization.
 pub trait Handler<S>: Send + Sync {
     /// Invoke the handler, resolving to the JSON result value or an error.
     fn call(&self, state: S, req: Request) -> HandlerFuture;
+
+    /// Invoke a notification handler and discard its result.
+    ///
+    /// The default awaits [`call`](Self::call). Closure-based handlers override
+    /// this to skip serialization of their discarded return values.
+    fn notify(&self, state: S, req: Request) -> NotificationFuture {
+        let future = self.call(state, req);
+        Box::pin(async move {
+            let _ = future.await;
+        })
+    }
 }
 
 impl<S, F, Fut, T> Handler<S> for F
@@ -151,6 +167,13 @@ where
                 .map_err(|e| Error::internal_error().with_data(e.to_string()))
         })
     }
+
+    fn notify(&self, state: S, req: Request) -> NotificationFuture {
+        let future = (self)(state, req);
+        Box::pin(async move {
+            let _ = future.await;
+        })
+    }
 }
 
 /// A handler that receives per-request context alongside state.
@@ -162,6 +185,17 @@ where
 pub trait HandlerWithContext<S>: Send + Sync {
     /// Invoke the handler with state, request, and context.
     fn call(&self, state: S, req: Request, ctx: RequestContext) -> HandlerFuture;
+
+    /// Invoke a notification handler with context and discard its result.
+    ///
+    /// The default awaits [`call`](Self::call). Closure-based handlers override
+    /// this to skip serialization of their discarded return values.
+    fn notify(&self, state: S, req: Request, ctx: RequestContext) -> NotificationFuture {
+        let future = self.call(state, req, ctx);
+        Box::pin(async move {
+            let _ = future.await;
+        })
+    }
 }
 
 impl<S, F, Fut, T> HandlerWithContext<S> for F
@@ -176,6 +210,13 @@ where
             let value = fut.await?;
             crate::json::to_raw_value(&value)
                 .map_err(|e| Error::internal_error().with_data(e.to_string()))
+        })
+    }
+
+    fn notify(&self, state: S, req: Request, ctx: RequestContext) -> NotificationFuture {
+        let future = (self)(state, req, ctx);
+        Box::pin(async move {
+            let _ = future.await;
         })
     }
 }
@@ -251,6 +292,13 @@ impl<S> Method<S> {
         match self {
             Method::Handler(h) => h.call(state, req).await,
             Method::WithContext(h) => h.call(state, req, ctx).await,
+        }
+    }
+
+    async fn notify(&self, state: S, req: Request, ctx: RequestContext) {
+        match self {
+            Method::Handler(handler) => handler.notify(state, req).await,
+            Method::WithContext(handler) => handler.notify(state, req, ctx).await,
         }
     }
 }
@@ -475,7 +523,14 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         };
 
         let result = match self.methods.get(req.method()) {
-            Some(handler) => handler.call(self.state.clone(), req, ctx).await,
+            Some(handler) => {
+                let state = self.state.clone();
+                if id.is_none() {
+                    handler.notify(state, req, ctx).await;
+                    return None;
+                }
+                handler.call(state, req, ctx).await
+            }
             None => Err(Error::method_not_found()),
         };
 
@@ -600,6 +655,112 @@ mod tests {
             .await;
         assert!(matches!(out, Output::Empty));
         assert!(out.to_bytes().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn notifications_drop_results_without_serializing_them() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Stats {
+            calls: AtomicUsize,
+            serializations: AtomicUsize,
+            drops: AtomicUsize,
+        }
+
+        struct TrackedResult(Arc<Stats>);
+
+        impl serde::Serialize for TrackedResult {
+            fn serialize<T: serde::Serializer>(&self, serializer: T) -> Result<T::Ok, T::Error> {
+                self.0.serializations.fetch_add(1, Ordering::Relaxed);
+                serializer.serialize_i64(42)
+            }
+        }
+
+        impl Drop for TrackedResult {
+            fn drop(&mut self) {
+                self.0.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for with_context in [false, true] {
+            let stats = Arc::new(Stats::default());
+            let router = Router::with_state(Arc::clone(&stats));
+            let router = if with_context {
+                router.register_with_context(
+                    "tracked",
+                    |stats: Arc<Stats>, _req: Request, _ctx: RequestContext| async move {
+                        stats.calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(TrackedResult(stats))
+                    },
+                )
+            } else {
+                router.register("tracked", |stats: Arc<Stats>, _req: Request| async move {
+                    stats.calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(TrackedResult(stats))
+                })
+            };
+
+            for input in [
+                br#"{"jsonrpc":"2.0","method":"tracked"}"#.as_slice(),
+                br#"[{"jsonrpc":"2.0","method":"tracked"},{"jsonrpc":"2.0","method":"tracked"}]"#
+                    .as_slice(),
+            ] {
+                assert!(matches!(router.handle_bytes(input).await, Output::Empty));
+            }
+            assert_eq!(stats.calls.load(Ordering::Relaxed), 3);
+            assert_eq!(stats.serializations.load(Ordering::Relaxed), 0);
+            assert_eq!(stats.drops.load(Ordering::Relaxed), 3);
+
+            let output = router
+                .handle_bytes(br#"[{"jsonrpc":"2.0","method":"tracked"},{"jsonrpc":"2.0","method":"tracked","id":null}]"#)
+                .await;
+            let Output::Batch(responses) = output else {
+                panic!("expected one response from the mixed batch");
+            };
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].id(), &Id::Null);
+            assert_eq!(responses[0].result_as::<i64>(), Some(42));
+            assert_eq!(stats.calls.load(Ordering::Relaxed), 5);
+            assert_eq!(stats.serializations.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.drops.load(Ordering::Relaxed), 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_handlers_keep_the_default_notification_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CustomHandler(Arc<AtomicUsize>);
+
+        impl Handler<()> for CustomHandler {
+            fn call(&self, _state: (), _req: Request) -> HandlerFuture {
+                let calls = Arc::clone(&self.0);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err(Error::internal_error())
+                })
+            }
+        }
+
+        impl HandlerWithContext<()> for CustomHandler {
+            fn call(&self, state: (), req: Request, _ctx: RequestContext) -> HandlerFuture {
+                Handler::call(self, state, req)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .register("plain", CustomHandler(Arc::clone(&calls)))
+            .register_with_context("context", CustomHandler(Arc::clone(&calls)));
+
+        let output = router
+            .handle_bytes(
+                br#"[{"jsonrpc":"2.0","method":"plain"},{"jsonrpc":"2.0","method":"context"}]"#,
+            )
+            .await;
+        assert!(matches!(output, Output::Empty));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

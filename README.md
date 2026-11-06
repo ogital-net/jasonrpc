@@ -183,20 +183,22 @@ cargo run --example ws_controller --features "server,websocket,tokio,hyper"
 
 ## Benchmarks
 
-`benches/dispatch.rs` covers single/batch dispatch, request parse/build, and
-framing. The JSON backends are mutually exclusive, so the same bench is run once
-per backend and compared through criterion baselines — the baseline name carries
+`benches/dispatch.rs` covers single/batch dispatch, notification results,
+request parse/build, framing, and chunked reads of large frames. Enable `newline`
+to compare newline and netstring read performance. The JSON backends are mutually
+exclusive, so the same bench is run once per backend and compared through
+criterion baselines — the baseline name carries
 the backend identity, and the benchmark ids match, so the second run prints a
 per-benchmark delta:
 
 ```sh
 # serde_json backend — save its numbers under the `serde_json` baseline
 cargo bench --bench dispatch \
-    --features "server,tokio,netstring" -- --save-baseline serde_json
+    --features "server,tokio,netstring,newline" -- --save-baseline serde_json
 
 # sonic-rs backend, diffed against the serde_json baseline
 cargo bench --bench dispatch --no-default-features \
-    --features "backend-sonic,server,tokio,netstring" -- --baseline serde_json
+    --features "backend-sonic,server,tokio,netstring,newline" -- --baseline serde_json
 ```
 
 A plain `cargo bench` (no features) prints the command to re-run with the

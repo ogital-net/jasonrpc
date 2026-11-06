@@ -8,12 +8,12 @@
 //! ```sh
 //! # Default backend (serde_json) — save its numbers under the `serde_json` name
 //! cargo bench --bench dispatch \
-//!     --features "server,tokio,netstring" -- --save-baseline serde_json
+//!     --features "server,tokio,netstring,newline" -- --save-baseline serde_json
 //!
 //! # sonic-rs backend, diffed against the serde_json baseline. Because ids
 //! # match, criterion prints a per-benchmark percentage delta.
 //! cargo bench --bench dispatch --no-default-features \
-//!     --features "backend-sonic,server,tokio,netstring" -- --baseline serde_json
+//!     --features "backend-sonic,server,tokio,netstring,newline" -- --baseline serde_json
 //! ```
 //!
 //! On x86-64 the default `target-cpu` is a conservative baseline (SSE2 only),
@@ -25,6 +25,7 @@
 //! than declare them as `required-features` (which makes a plain `cargo bench`
 //! silently skip this target), the bench compiles without them and prints how
 //! to re-run.
+//! Enable `newline` as well to compare large newline and netstring framed reads.
 
 // When the needed features are missing, compile a tiny `main` that explains how
 // to run the benchmark, so `cargo bench` is never a silent no-op.
@@ -71,6 +72,9 @@ mod bench_impl {
                 Ok(p)
             })
             .register("noop", |_, _req: Request| async move { Ok(()) })
+            .register("large_result", |_, _req: Request| async move {
+                Ok(vec![0_u8; 64 * 1024])
+            })
     }
 
     /// A current-thread runtime is enough: handlers here are CPU-bound and never
@@ -109,6 +113,15 @@ mod bench_impl {
         group.bench_function("single_notification", |b| {
             b.iter(|| {
                 let out = rt.block_on(router.handle_bytes(std::hint::black_box(notif)));
+                std::hint::black_box(out.to_bytes().unwrap());
+            });
+        });
+
+        let large_notif = br#"{"jsonrpc":"2.0","method":"large_result"}"#;
+        group.throughput(Throughput::Bytes(large_notif.len() as u64));
+        group.bench_function("single_notification_large_result", |b| {
+            b.iter(|| {
+                let out = rt.block_on(router.handle_bytes(std::hint::black_box(large_notif)));
                 std::hint::black_box(out.to_bytes().unwrap());
             });
         });
@@ -208,12 +221,60 @@ mod bench_impl {
         group.finish();
     }
 
+    fn bench_framed_reads(c: &mut Criterion) {
+        use jasonrpc::transport::io::FramedReader;
+        use jasonrpc::transport::{Framing, Netstring};
+
+        let rt = runtime();
+        let mut group = c.benchmark_group("framed_read");
+
+        for size in [1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024] {
+            let payload = vec![b'x'; size];
+            let mut netstring = Vec::new();
+            Netstring.encode(&payload, &mut netstring);
+            group.throughput(Throughput::Bytes(size as u64));
+            group.bench_with_input(
+                BenchmarkId::new("netstring", size),
+                &netstring,
+                |bench, framed| {
+                    bench.iter(|| {
+                        let mut reader =
+                            FramedReader::new(std::hint::black_box(framed.as_slice()), Netstring);
+                        std::hint::black_box(rt.block_on(reader.recv()).unwrap().unwrap());
+                    });
+                },
+            );
+
+            #[cfg(feature = "newline")]
+            {
+                use jasonrpc::transport::Newline;
+
+                let mut newline = Vec::new();
+                Newline.encode(&payload, &mut newline);
+                group.bench_with_input(
+                    BenchmarkId::new("newline", size),
+                    &newline,
+                    |bench, framed| {
+                        bench.iter(|| {
+                            let mut reader =
+                                FramedReader::new(std::hint::black_box(framed.as_slice()), Newline);
+                            std::hint::black_box(rt.block_on(reader.recv()).unwrap().unwrap());
+                        });
+                    },
+                );
+            }
+        }
+
+        group.finish();
+    }
+
     criterion_group!(
         benches,
         bench_single_dispatch,
         bench_batch_dispatch,
         bench_protocol_roundtrip,
         bench_framing,
+        bench_framed_reads,
     );
 
     /// Entry point re-exported as the binary `main` when the required features

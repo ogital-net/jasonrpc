@@ -268,7 +268,7 @@ impl<A: Authorizer> HttpTransport<A> {
     /// `Authorization` value the authorizer produced for this attempt.
     fn build_request(
         &self,
-        request: &[u8],
+        request: Bytes,
         auth: Option<&HeaderValue>,
     ) -> Result<http::Request<Full<Bytes>>, HttpTransportError> {
         let mut builder = http::Request::builder()
@@ -289,7 +289,7 @@ impl<A: Authorizer> HttpTransport<A> {
             }
         }
         builder
-            .body(Full::new(Bytes::from(request.to_vec())))
+            .body(Full::new(request))
             .map_err(|e| HttpTransportError::Connect(Box::new(e)))
     }
 
@@ -336,7 +336,8 @@ impl<A: Authorizer> Transport for HttpTransport<A> {
             .await
             .map_err(HttpTransportError::Auth)?;
 
-        let req = self.build_request(&request, auth.as_ref())?;
+        let request = Bytes::from(request);
+        let req = self.build_request(request.clone(), auth.as_ref())?;
         let resp = self
             .client
             .request(req)
@@ -353,7 +354,7 @@ impl<A: Authorizer> Transport for HttpTransport<A> {
                 .authorize()
                 .await
                 .map_err(HttpTransportError::Auth)?;
-            let req = self.build_request(&request, auth.as_ref())?;
+            let req = self.build_request(request, auth.as_ref())?;
             self.client
                 .request(req)
                 .await
@@ -460,6 +461,26 @@ mod tests {
             self.invalidated.store(true, Ordering::SeqCst);
             true
         }
+    }
+
+    #[tokio::test]
+    async fn request_attempts_share_the_original_payload_allocation() {
+        let transport = HttpTransport::new("http://127.0.0.1:8080/").unwrap();
+        let payload = br#"{"jsonrpc":"2.0","method":"ping","id":1}"#.to_vec();
+        let original_ptr = payload.as_ptr();
+        let payload = Bytes::from(payload);
+        let first = transport.build_request(payload.clone(), None).unwrap();
+        let retry = transport.build_request(payload, None).unwrap();
+
+        let first_body = first.into_body().collect().await.unwrap().to_bytes();
+        let retry_body = retry.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(first_body.as_ptr(), original_ptr);
+        assert_eq!(retry_body.as_ptr(), original_ptr);
+        assert_eq!(first_body, retry_body);
+        assert_eq!(
+            first_body.as_ref(),
+            br#"{"jsonrpc":"2.0","method":"ping","id":1}"#
+        );
     }
 
     #[tokio::test]
