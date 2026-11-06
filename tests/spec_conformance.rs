@@ -181,6 +181,52 @@ async fn invalid_batch_bad_json() {
 }
 
 #[tokio::test]
+async fn batch_with_trailing_input_never_executes_handlers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::with_state(Arc::clone(&calls)).register(
+        "tracked",
+        |calls: Arc<AtomicUsize>, _req: Request| async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, Error>(42)
+        },
+    );
+
+    for limit in [2, 1, 0] {
+        let router = router.clone().with_max_batch_len(limit);
+        for batch in [
+            br#"[{"jsonrpc":"2.0","method":"tracked","id":1}]"#.as_slice(),
+            br#"[{"jsonrpc":"2.0","method":"tracked"}]"#.as_slice(),
+            b"[]".as_slice(),
+        ] {
+            for suffix in [
+                b"garbage".as_slice(),
+                b"[]".as_slice(),
+                b"{}".as_slice(),
+                b"true".as_slice(),
+                b"\0".as_slice(),
+                b"\xff".as_slice(),
+            ] {
+                let input = [batch, b" ".as_slice(), suffix].concat();
+                let output = router.handle_bytes(&input).await;
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    0,
+                    "executed input: {input:?}"
+                );
+                let Output::Single(response) = output else {
+                    panic!("expected a single Parse error response for {input:?}");
+                };
+                assert_eq!(response.id(), &jasonrpc::Id::Null);
+                assert_eq!(response.error_obj(), Some(&Error::parse_error()));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn empty_array_is_single_invalid_request() {
     let r = spec_router();
     let out = call(&r, b"[]").await;

@@ -150,26 +150,45 @@ mod imp {
         bytes: &[u8],
         max_items: Option<usize>,
     ) -> Result<super::ArrayItems<'_>, JsonError> {
+        use serde::de::{SeqAccess, Visitor};
+        use serde::Deserializer;
         use std::borrow::Cow;
-        // `to_array_iter` lazily yields each element; `as_raw_cow` returns a
-        // slice borrowing from `bytes` (the `'de` lifetime) for raw input,
-        // owning only if the element required unescaping.
-        let mut out = Vec::new();
-        let mut total_len = 0usize;
-        for item in sonic_rs::to_array_iter(bytes) {
-            let raw = item?;
-            total_len = total_len.saturating_add(1);
-            if max_items.is_none_or(|max| out.len() < max) {
-                out.push(match raw.as_raw_cow() {
-                    Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
-                    Cow::Owned(s) => Cow::Owned(s.into_bytes()),
-                });
+
+        struct ArrayVisitor {
+            max_items: Option<usize>,
+        }
+
+        impl<'de> Visitor<'de> for ArrayVisitor {
+            type Value = super::ArrayItems<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON array")
+            }
+
+            fn visit_seq<Access>(self, mut seq: Access) -> Result<Self::Value, Access::Error>
+            where
+                Access: SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                let mut total_len = 0usize;
+                while let Some(raw) = seq.next_element::<sonic_rs::LazyValue<'de>>()? {
+                    total_len = total_len.saturating_add(1);
+                    if self.max_items.is_none_or(|max| items.len() < max) {
+                        items.push(match raw.as_raw_cow() {
+                            Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
+                            Cow::Owned(text) => Cow::Owned(text.into_bytes()),
+                        });
+                    }
+                }
+                Ok(super::ArrayItems { items, total_len })
             }
         }
-        Ok(super::ArrayItems {
-            items: out,
-            total_len,
-        })
+
+        let text = std::str::from_utf8(bytes).map_err(<JsonError as serde::de::Error>::custom)?;
+        let mut deserializer = sonic_rs::Deserializer::from_str(text);
+        let items = deserializer.deserialize_seq(ArrayVisitor { max_items })?;
+        deserializer.end()?;
+        Ok(items)
     }
 
     pub fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<super::JsonRawValue, JsonError> {
@@ -333,6 +352,66 @@ mod tests {
 
     #[test]
     fn split_array_validates_elements_after_limit() {
-        assert!(split_array(b"[1,2,invalid]", Some(1)).is_err());
+        for input in [
+            b"[1,2,invalid]".as_slice(),
+            b"[1,\"\xff\"]".as_slice(),
+            br#"[1,"\q"]"#.as_slice(),
+            b"[1,\"raw\nnewline\"]".as_slice(),
+        ] {
+            for limit in [None, Some(1), Some(0)] {
+                assert!(
+                    split_array(input, limit).is_err(),
+                    "accepted invalid element with limit {limit:?}: {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_array_rejects_trailing_input() {
+        for input in [
+            b"[1] garbage".as_slice(),
+            b"[1][]".as_slice(),
+            b"[1] {}".as_slice(),
+            b"[1] true".as_slice(),
+            b"[1]\0".as_slice(),
+            b"[1]\xff".as_slice(),
+            b"[] garbage".as_slice(),
+        ] {
+            for limit in [None, Some(1), Some(0)] {
+                assert!(
+                    split_array(input, limit).is_err(),
+                    "accepted trailing input with limit {limit:?}: {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_array_accepts_trailing_whitespace() {
+        for input in [b"[1,2,3] \r\n\t".as_slice(), b"[] \r\n\t".as_slice()] {
+            let split = split_array(input, None).unwrap();
+            let values: Vec<Value> = from_slice(input).unwrap();
+            assert_eq!(split.total_len, values.len());
+            assert_eq!(split.items.len(), values.len());
+        }
+    }
+
+    #[test]
+    fn split_array_preserves_raw_elements_and_borrowing() {
+        let input = br#"[{"text":"a\\b","items":[1, 2]},"escaped\nstring","\u0061",3]"#;
+        let split = split_array(input, None).unwrap();
+        let expected: [&[u8]; 4] = [
+            br#"{"text":"a\\b","items":[1, 2]}"#,
+            br#""escaped\nstring""#,
+            br#""\u0061""#,
+            b"3",
+        ];
+        assert_eq!(split.total_len, expected.len());
+        assert_eq!(split.items.len(), expected.len());
+        assert!(matches!(&split.items[0], std::borrow::Cow::Borrowed(_)));
+        for (item, expected) in split.items.iter().zip(expected) {
+            assert_eq!(item.as_ref(), expected);
+        }
     }
 }
