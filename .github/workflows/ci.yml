@@ -165,12 +165,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.82
+      # MSRV checks our code with compatible dependencies, not every version
+      # allowed by Cargo.toml. Stable jobs continue to test current dependencies.
+      - name: Select MSRV-compatible Tokio
+        run: cargo update -p tokio --precise 1.48.0
       - uses: Swatinem/rust-cache@v2
-      # MSRV is verified against the default build (serde_json backend). Optional
-      # integrations (hyper, tower, http-client) track hyper's own MSRV, which
+      # Optional integrations (hyper, tower, http-client) track hyper's MSRV, which
       # may advance independently; consumers enabling those features must follow.
-      - run: cargo check
-      - run: cargo check --features "server,client,transport,netstring,newline,tokio"
+      - run: cargo check --locked
+      - run: cargo check --locked --features "server,client,transport,netstring,newline,tokio"
 
   # ---------------------------------------------------------------------------
   deny:
