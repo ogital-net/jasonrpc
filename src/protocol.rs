@@ -423,6 +423,7 @@ impl std::error::Error for Error {}
 /// A JSON-RPC 2.0 request or notification.
 ///
 /// A request with `id == None` is a *notification*: the server must not reply.
+/// Deserialization requires an object; arrays are not request representations.
 ///
 /// ```
 /// use jasonrpc::{Request, Id};
@@ -440,24 +441,52 @@ impl std::error::Error for Error {}
 /// let notif = Request::notification("update", &[1, 2, 3]);
 /// assert!(notif.is_notification());
 /// ```
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Request {
     jsonrpc: Version,
     method: String,
     /// Parameters as raw JSON. Use [`params_as`](Self::params_as) to
     /// deserialize into a concrete type.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "de_params"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<JsonRawValue>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        deserialize_with = "de_present_id"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<Id>,
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            jsonrpc: Version,
+            method: String,
+            #[serde(default, deserialize_with = "de_params")]
+            params: Option<JsonRawValue>,
+            #[serde(default, deserialize_with = "de_present_id")]
+            id: Option<Id>,
+        }
+
+        struct RequestVisitor;
+
+        impl<'de> Visitor<'de> for RequestVisitor {
+            type Value = Request;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON-RPC request object")
+            }
+
+            fn visit_map<Map: de::MapAccess<'de>>(self, map: Map) -> Result<Request, Map::Error> {
+                let fields = Fields::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(Request {
+                    jsonrpc: fields.jsonrpc,
+                    method: fields.method,
+                    params: fields.params,
+                    id: fields.id,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(RequestVisitor)
+    }
 }
 
 impl Request {
@@ -748,6 +777,25 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_deserialization_requires_an_object() {
+        for input in [
+            br#"["2.0","tracked",[],1]"#.as_slice(),
+            br#"["2.0","tracked",[]]"#.as_slice(),
+            b"[]".as_slice(),
+            b"null".as_slice(),
+            b"true".as_slice(),
+            b"7".as_slice(),
+            br#""tracked""#.as_slice(),
+        ] {
+            assert!(
+                crate::json::from_slice::<Request>(input).is_err(),
+                "accepted non-object request: {}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
 
     #[test]
     fn id_preserves_wire_type() {

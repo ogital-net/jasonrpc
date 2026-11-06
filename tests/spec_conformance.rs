@@ -206,6 +206,61 @@ async fn batch_of_invalids() {
 }
 
 #[tokio::test]
+async fn non_object_batch_entries_never_execute_handlers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::with_state(Arc::clone(&calls)).register(
+        "tracked",
+        |calls: Arc<AtomicUsize>, _req: Request| async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, Error>(42)
+        },
+    );
+
+    for input in [
+        br#"[["2.0","tracked",[],1]]"#.as_slice(),
+        br#"[["2.0","tracked",[]]]"#.as_slice(),
+        br#"[[],[{}],null,true,7,"tracked"]"#.as_slice(),
+    ] {
+        let Output::Batch(responses) = router.handle_bytes(input).await else {
+            panic!("expected a batch of Invalid Request responses");
+        };
+        let entries: Vec<Value> = json::from_slice(input).unwrap();
+        assert_eq!(responses.len(), entries.len());
+        for response in responses {
+            assert_eq!(response.id(), &jasonrpc::Id::Null);
+            assert_eq!(response.error_obj(), Some(&Error::invalid_request()));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    let Output::Batch(responses) = router
+        .handle_bytes(
+            br#"[
+                ["2.0","tracked",[],1],
+                {"jsonrpc":"2.0","method":"tracked","id":2},
+                ["2.0","tracked",[]]
+            ]"#,
+        )
+        .await
+    else {
+        panic!("expected a mixed batch response");
+    };
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(responses.len(), 3);
+    for response in &responses {
+        if response.id() == &jasonrpc::Id::Number(2) {
+            assert_eq!(response.result_as::<i64>(), Some(42));
+        } else {
+            assert_eq!(response.id(), &jasonrpc::Id::Null);
+            assert_eq!(response.error_obj(), Some(&Error::invalid_request()));
+        }
+    }
+}
+
+#[tokio::test]
 async fn mixed_batch() {
     let r = spec_router();
     let out = call(
