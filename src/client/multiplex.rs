@@ -24,7 +24,7 @@
 //! [`send_notification`](Transport::send_notification) just writes the frame and
 //! returns without registering a waiter.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
@@ -294,10 +294,12 @@ where
             if !state.connected {
                 return Err(MultiplexError::ConnectionClosed);
             }
-            if state.pending.contains_key(&id) {
-                return Err(MultiplexError::DuplicateId);
+            match state.pending.entry(id.clone()) {
+                Entry::Occupied(_) => return Err(MultiplexError::DuplicateId),
+                Entry::Vacant(entry) => {
+                    entry.insert(tx);
+                }
             }
-            state.pending.insert(id.clone(), tx);
         }
         let guard = PendingGuard::new(&self.state, id);
 
