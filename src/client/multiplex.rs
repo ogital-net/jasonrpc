@@ -28,12 +28,12 @@ use std::collections::{hash_map::Entry, HashMap};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
 use super::Transport;
 use crate::json;
 use crate::protocol::Id;
-use crate::transport::io::{FramedReader, FramedWriter};
+use crate::transport::io::{FramedReader, FramedWriter, DEFAULT_MAX_FRAME_SIZE};
 use crate::transport::Framing;
 
 /// Errors produced by [`MultiplexTransport`].
@@ -88,6 +88,15 @@ impl From<crate::error::TransportError> for MultiplexError {
 struct ConnectionState {
     connected: bool,
     pending: HashMap<Id, oneshot::Sender<Vec<u8>>>,
+    closed: watch::Sender<bool>,
+}
+
+impl ConnectionState {
+    fn disconnect(&mut self) {
+        self.connected = false;
+        self.pending.clear();
+        self.closed.send_replace(true);
+    }
 }
 
 type SharedState = Arc<Mutex<ConnectionState>>;
@@ -139,8 +148,7 @@ impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
             let mut state = self.state.lock().unwrap();
-            state.connected = false;
-            state.pending.clear();
+            state.disconnect();
         }
     }
 }
@@ -206,10 +214,20 @@ where
     /// When the connection ends, all pending and future calls fail with
     /// [`MultiplexError::ConnectionClosed`].
     pub fn new(stream: S, framing: F) -> Self {
+        Self::new_with_max_frame_size(stream, framing, DEFAULT_MAX_FRAME_SIZE)
+    }
+
+    /// Build a multiplexing transport with a maximum incoming frame size.
+    ///
+    /// The limit includes framing bytes and does not constrain outgoing writes.
+    /// Set to zero to disable the limit. Unbounded buffering is not recommended
+    /// for network-facing clients. Other behavior matches [`Self::new`].
+    pub fn new_with_max_frame_size(stream: S, framing: F, max_frame_size: usize) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
         let state = Arc::new(Mutex::new(ConnectionState {
             connected: true,
             pending: HashMap::new(),
+            closed: watch::channel(false).0,
         }));
 
         let writer = Arc::new(AsyncMutex::new(FramedWriter::new(
@@ -218,7 +236,7 @@ where
         )));
 
         // Spawn the reader task: decode frames, route by id.
-        let reader = FramedReader::new(read_half, framing);
+        let reader = FramedReader::new(read_half, framing).with_max_frame_size(max_frame_size);
         let reader_task = Arc::new(ReaderTaskGuard(tokio::spawn(reader_loop(
             reader,
             Arc::clone(&state),
@@ -256,8 +274,7 @@ where
             // Marking the connection dead and clearing waiters under the same
             // lock makes teardown atomic with new waiter registration.
             let mut state = state.lock().unwrap();
-            state.connected = false;
-            state.pending.clear();
+            state.disconnect();
             return;
         }
     }
@@ -349,6 +366,16 @@ where
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.state.lock().unwrap().connected
+    }
+
+    /// Wait until the connection becomes unusable through EOF, a framing or
+    /// I/O error, or cancellation of an in-progress frame write.
+    ///
+    /// Returns immediately if already closed. Multiple concurrent waiters are
+    /// supported, and cancelling this wait does not affect the connection.
+    pub async fn closed(&self) {
+        let mut closed = self.state.lock().unwrap().closed.subscribe();
+        let _ = closed.wait_for(|closed| *closed).await;
     }
 
     /// The number of in-flight calls currently registered in the pending map.
@@ -508,6 +535,68 @@ mod tests {
         let err = client.call::<_, String>("whatever", ()).await.unwrap_err();
         // Should surface as a transport error, not hang.
         assert!(matches!(err, crate::error::ClientError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn configured_frame_limit_controls_incoming_responses_only() {
+        for limit in [64, 256, 0] {
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            tokio::spawn(run_mock_server(server_io));
+            let transport =
+                MultiplexTransport::new_with_max_frame_size(client_io, Netstring, limit);
+            let client =
+                Client::new(transport).with_request_timeout(std::time::Duration::from_secs(1));
+            let method = "x".repeat(128);
+            let response = client.call::<_, String>(&method, ()).await;
+            if limit == 64 {
+                assert!(matches!(
+                    response,
+                    Err(crate::error::ClientError::Transport(_))
+                ));
+            } else {
+                assert_eq!(response.unwrap(), method);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_notifies_all_waiters_and_remembers_eof() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let first = transport.closed();
+        let second = transport.closed();
+        tokio::pin!(first, second);
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+
+        drop(server_io);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(first, second);
+            transport.closed().await;
+        })
+        .await
+        .expect("closure must wake existing and future waiters");
+        assert!(!transport.is_connected());
+    }
+
+    #[tokio::test]
+    async fn closed_notifies_waiters_after_cancelled_partial_write() {
+        let (client_io, _server_io) = tokio::io::duplex(16);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let closed = transport.closed();
+        tokio::pin!(closed);
+        assert_pending(closed.as_mut()).await;
+
+        let notification =
+            crate::client::encode_notification("large", &("x".repeat(4096),)).unwrap();
+        let mut sending = Box::pin(transport.send_notification(notification));
+        assert_pending(sending.as_mut()).await;
+        drop(sending);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), closed)
+            .await
+            .expect("a cancelled partial write must notify closure");
+        assert!(!transport.is_connected());
     }
 
     #[tokio::test]
