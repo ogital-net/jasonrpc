@@ -50,19 +50,24 @@ pub(crate) async fn dispatch<S>(router: &Router<S>, body: &[u8]) -> HttpOutcome
 where
     S: Clone + Send + Sync + 'static,
 {
-    dispatch_with_context(router, body, RequestContext::default()).await
+    dispatch_with_context(
+        router,
+        Bytes::copy_from_slice(body),
+        RequestContext::default(),
+    )
+    .await
 }
 
 /// Dispatch with per-request context (HTTP headers, auth claims, etc.).
 pub(crate) async fn dispatch_with_context<S>(
     router: &Router<S>,
-    body: &[u8],
+    body: Bytes,
     ctx: RequestContext,
 ) -> HttpOutcome
 where
     S: Clone + Send + Sync + 'static,
 {
-    let output = router.handle_bytes_with_context(body, ctx).await;
+    let output = router.handle_shared_bytes_with_context(body, ctx).await;
     match output.to_bytes() {
         Ok(Some(bytes)) => HttpOutcome {
             status: 200,

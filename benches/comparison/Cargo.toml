@@ -1,0 +1,29 @@
+[package]
+name = "jasonrpc-comparison"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+
+[workspace]
+
+[features]
+default = ["serde-json"]
+serde-json = ["jasonrpc/backend-serde-json"]
+sonic = ["jasonrpc/backend-sonic"]
+
+[dev-dependencies]
+jasonrpc = { path = "../..", default-features = false, features = ["server"] }
+jsonrpsee-core = { version = "=0.26.1", default-features = false, features = ["server"] }
+jsonrpsee-types = "=0.26.1"
+jsonrpc-core = { version = "=18.0.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["rt", "time"] }
+criterion = "0.5"
+bytes = "1"
+
+[[bench]]
+name = "comparison"
+path = "comparison.rs"
+harness = false

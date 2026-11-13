@@ -105,6 +105,59 @@ Those details may include submitted values. To return only a generic error, use
 to display the attached details; the protocol error's `Display` shows only its
 message and code.
 
+### Large Requests And Borrowed Params
+
+`Request::params_as_borrowed` allows decoded fields to borrow from the request.
+Use `#[serde(borrow)] Cow<'_, str>` for an attachment's base64 text: ordinary
+unescaped strings are borrowed, while JSON escapes fall back to owned strings.
+Keep the request alive while using the decoded fields, including across awaits.
+The existing `params_as` and `param_as` APIs are unchanged.
+
+```rust
+# #[cfg(feature = "server")]
+# #[tokio::main]
+# async fn main() {
+use jasonrpc::{Error, Request};
+use jasonrpc::server::Router;
+use std::borrow::Cow;
+
+#[derive(serde::Deserialize)]
+struct Attachment<'a> {
+    #[serde(borrow)]
+    data: Cow<'a, str>,
+}
+
+let router = Router::new().register("ingest", |_, request: Request| async move {
+    let params: Attachment<'_> = request.params_as_borrowed()
+        .map_err(|_| Error::invalid_params())?;
+    Ok(params.data.len())
+});
+
+let body = bytes::Bytes::from_static(
+    br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"YWJj"},"id":1}"#,
+);
+let _output = router.handle_shared_bytes(body).await;
+# }
+# #[cfg(not(feature = "server"))]
+# fn main() {}
+```
+
+Hyper and Tower adapters automatically dispatch collected `Bytes` through this
+shared path. Params are slices of the body, and cloned requests share its
+allocation on both JSON backends. `server` now enables the small `bytes`
+dependency; protocol-only users still do not need it. `handle_bytes(&[u8])`
+remains available, but must allocate owned raw params.
+
+Sonic requests built directly or deserialized outside shared dispatch cache a
+serialized params string on the first borrowed decode. The shared HTTP path
+does not need that cache. Sharing is not streaming: HTTP chunk coalescing may
+still copy, and retaining a request can retain the whole body or batch buffer.
+The default HTTP request limit remains 16 MiB; set `with_max_request_body_size`
+on the adapter to a bounded limit covering the encoded body and metadata.
+Base64 expands binary data by approximately one third. Bound concurrent large
+requests and decode attachments into storage incrementally to avoid an additional
+full decoded allocation. See the [attachment ownership measurements](benches/comparison/README.md#large-attachment-ownership).
+
 ### Client
 
 ```rust,ignore
@@ -268,6 +321,15 @@ well as standalone decoding.
 On x86-64, add `RUSTFLAGS="-C target-cpu=native"` for a fair `sonic-rs`
 comparison — the default `target-cpu` there is a conservative baseline (SSE2)
 that handicaps SIMD parsing. On aarch64, NEON is already enabled by default.
+
+### Cross-crate comparison
+
+The isolated [comparison benchmark](benches/comparison/README.md) measures
+matched raw JSON single-call workloads against `jsonrpsee-core` and
+`jsonrpc-core`, with output-equivalence checks and separate serde-json/Sonic
+runs. Its dependencies do not affect the library's normal build or MSRV.
+The comparison documents helper-specific overhead and local results; it is
+not an end-to-end network benchmark.
 
 ### Allocation profiling
 

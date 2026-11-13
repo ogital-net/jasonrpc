@@ -454,6 +454,45 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     /// Like [`handle_bytes`](Self::handle_bytes) but passes `ctx` to handlers
     /// registered with [`register_with_context`](Self::register_with_context).
     pub async fn handle_bytes_with_context(&self, bytes: &[u8], ctx: RequestContext) -> Output {
+        self.handle_input_with_context(bytes, None, ctx).await
+    }
+
+    /// Process an owned shared buffer without copying request params.
+    ///
+    /// Params retain a slice of this buffer. Use [`Request::params_as_borrowed`]
+    /// to borrow unescaped strings directly from it. Cloning requests shares
+    /// the allocation; keeping one request alive can retain the entire buffer.
+    pub async fn handle_shared_bytes(&self, bytes: bytes::Bytes) -> Output {
+        self.handle_shared_bytes_with_context(bytes, RequestContext::default())
+            .await
+    }
+
+    /// Like [`handle_shared_bytes`](Self::handle_shared_bytes), with request context.
+    pub async fn handle_shared_bytes_with_context(
+        &self,
+        bytes: bytes::Bytes,
+        ctx: RequestContext,
+    ) -> Output {
+        self.handle_input_with_context(&bytes, Some(&bytes), ctx)
+            .await
+    }
+
+    fn parse_input(
+        bytes: &[u8],
+        shared: Option<&bytes::Bytes>,
+    ) -> Result<Request, json::JsonError> {
+        match shared {
+            Some(body) => Request::from_shared_bytes(body.slice_ref(bytes)),
+            None => json::from_slice(bytes),
+        }
+    }
+
+    async fn handle_input_with_context(
+        &self,
+        bytes: &[u8],
+        shared: Option<&bytes::Bytes>,
+        ctx: RequestContext,
+    ) -> Output {
         // Peek at the first non-whitespace byte to distinguish a batch (array,
         // `[`) from a single request (object, `{`) without a full parse.
         let first = match bytes.iter().find(|b| !b.is_ascii_whitespace()) {
@@ -461,9 +500,12 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
             None => return Output::Single(Response::error(Id::Null, Error::parse_error())),
         };
         match first {
-            b'[' => self.handle_batch_bytes_with_context(bytes, ctx).await,
+            b'[' => {
+                self.handle_batch_bytes_with_context(bytes, shared, ctx)
+                    .await
+            }
             b'{' => {
-                if let Ok(req) = json::from_slice::<Request>(bytes) {
+                if let Ok(req) = Self::parse_input(bytes, shared) {
                     if let Some(resp) = self.handle_request_with_context(req, ctx).await {
                         Output::Single(resp)
                     } else {
@@ -546,9 +588,10 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     async fn handle_element_bytes_with_context(
         &self,
         bytes: &[u8],
+        shared: Option<&bytes::Bytes>,
         ctx: &RequestContext,
     ) -> Option<Response> {
-        match json::from_slice::<Request>(bytes) {
+        match Self::parse_input(bytes, shared) {
             Ok(req) => {
                 // Each batch element gets its own clone of the context.
                 self.handle_request_with_context(req, ctx.clone()).await
@@ -558,7 +601,12 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     }
 
     /// Process a batch with context.
-    async fn handle_batch_bytes_with_context(&self, bytes: &[u8], ctx: RequestContext) -> Output {
+    async fn handle_batch_bytes_with_context(
+        &self,
+        bytes: &[u8],
+        shared: Option<&bytes::Bytes>,
+        ctx: RequestContext,
+    ) -> Output {
         // Elements borrow from `bytes` — no per-element copy in the common case.
         let split = if let Ok(items) = json::split_array(bytes, self.max_batch_len) {
             items
@@ -594,7 +642,14 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
 
         let mut responses = Vec::new();
         for item in &split.items {
-            if let Some(resp) = self.handle_element_bytes_with_context(item, &ctx).await {
+            let item_shared = match item {
+                std::borrow::Cow::Borrowed(_) => shared,
+                std::borrow::Cow::Owned(_) => None,
+            };
+            if let Some(resp) = self
+                .handle_element_bytes_with_context(item, item_shared, &ctx)
+                .await
+            {
                 if responses.is_empty() {
                     responses.reserve_exact(split.items.len());
                 }
@@ -640,6 +695,37 @@ mod tests {
             .register("notify", |_, _req: Request| async move {
                 Ok(crate::json::null())
             })
+    }
+
+    #[tokio::test]
+    async fn shared_bytes_borrow_large_params_across_await_and_batches() {
+        #[derive(serde::Deserialize)]
+        struct Params<'a> {
+            data: &'a str,
+        }
+        let prefix = r#"[{"jsonrpc":"2.0","method":"ingest","params":{"data":""#;
+        let mut body = Vec::with_capacity(prefix.len() + 1024 * 1024 + 12);
+        body.extend_from_slice(prefix.as_bytes());
+        body.resize(body.len() + 1024 * 1024, b'A');
+        body.extend_from_slice(br#""},"id":1}]"#);
+        let body = bytes::Bytes::from(body);
+        let expected = body[prefix.len()..].as_ptr() as usize;
+        let router =
+            Router::with_state(expected).register("ingest", |expected, req: Request| async move {
+                let params: Params<'_> = req
+                    .params_as_borrowed()
+                    .map_err(|error| Error::invalid_params().with_data(error.to_string()))?;
+                assert_eq!(params.data.as_ptr() as usize, expected);
+                tokio::task::yield_now().await;
+                assert_eq!(params.data.len(), 1024 * 1024);
+                Ok(params.data.len())
+            });
+        let output = router.handle_shared_bytes(body).await;
+        let responses = match output {
+            Output::Batch(responses) => responses,
+            _ => panic!("expected batch response"),
+        };
+        assert_eq!(responses[0].result_as::<usize>().unwrap(), 1024 * 1024);
     }
 
     #[tokio::test]

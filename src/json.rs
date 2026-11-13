@@ -104,13 +104,10 @@ mod imp {
     }
 
     pub fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<super::JsonRawValue, JsonError> {
-        let json = serde_json::to_string(v)?;
-        serde_json::value::RawValue::from_string(json)
+        serde_json::value::to_raw_value(v)
     }
 
-    /// Deserialize a `JsonRawValue` into a typed structure. Zero-copy:
-    /// `RawValue` holds the JSON text as a `&str` pointing into the original
-    /// input buffer.
+    /// Deserialize directly from the raw JSON text without an intermediate buffer.
     pub fn from_raw_value<T: serde::de::DeserializeOwned>(
         raw: &super::JsonRawValue,
     ) -> Result<T, JsonError> {
@@ -202,20 +199,17 @@ mod imp {
     }
 
     pub fn to_raw_value<T: serde::Serialize>(v: &T) -> Result<super::JsonRawValue, JsonError> {
-        let json = sonic_rs::to_vec(v)?;
-        sonic_rs::from_slice::<super::JsonRawValue>(&json)
+        let text = sonic_rs::to_string(v)?;
+        sonic_rs::from_str::<super::JsonRawValue>(&text)
     }
 
-    /// Deserialize a `JsonRawValue` into a typed structure.
-    ///
-    /// TODO: when <https://github.com/cloudwego/sonic-rs/pull/230> is merged
-    /// and released, replace this with a zero-copy
-    /// `sonic_rs::from_str(raw.as_raw_str().unwrap_or("null"))`.
+    /// Deserialize reserialized raw JSON without rechecking the serializer's UTF-8.
+    /// Sonic 0.5's owned lazy values do not expose their raw text directly.
     pub fn from_raw_value<T: serde::de::DeserializeOwned>(
         raw: &super::JsonRawValue,
     ) -> Result<T, JsonError> {
-        let bytes = sonic_rs::to_vec(raw)?;
-        sonic_rs::from_slice(&bytes)
+        let text = sonic_rs::to_string(raw)?;
+        sonic_rs::from_str(&text)
     }
 
     pub fn raw_value_kind(raw: &super::JsonRawValue) -> super::RawValueKind {
@@ -247,9 +241,15 @@ pub type JsonRawValue = Box<serde_json::value::RawValue>;
 #[cfg(feature = "backend-sonic")]
 pub type JsonRawValue = sonic_rs::OwnedLazyValue;
 
-#[cfg(all(feature = "client", feature = "tokio", feature = "backend-serde-json"))]
+#[cfg(all(
+    any(feature = "server", all(feature = "client", feature = "tokio")),
+    feature = "backend-serde-json"
+))]
 pub(crate) type BorrowedRawValue<'a> = &'a serde_json::value::RawValue;
-#[cfg(all(feature = "client", feature = "tokio", feature = "backend-sonic"))]
+#[cfg(all(
+    any(feature = "server", all(feature = "client", feature = "tokio")),
+    feature = "backend-sonic"
+))]
 pub(crate) type BorrowedRawValue<'a> = sonic_rs::LazyValue<'a>;
 
 #[cfg(all(feature = "client", feature = "tokio"))]
@@ -266,7 +266,7 @@ pub(crate) fn from_slice_borrowed<'de, T: serde::Deserialize<'de>>(
     }
 }
 
-#[cfg(all(feature = "client", feature = "tokio"))]
+#[cfg(any(feature = "server", all(feature = "client", feature = "tokio")))]
 pub(crate) fn borrowed_raw_text<'a>(raw: &'a BorrowedRawValue<'_>) -> std::borrow::Cow<'a, str> {
     #[cfg(feature = "backend-serde-json")]
     {
@@ -285,7 +285,7 @@ pub(crate) enum RawValueKind {
     Scalar,
 }
 
-#[cfg(any(feature = "backend-serde-json", feature = "client"))]
+#[cfg(any(feature = "backend-serde-json", feature = "client", feature = "server"))]
 pub(crate) fn classify_raw_value(bytes: &[u8]) -> RawValueKind {
     match bytes.iter().find(|byte| !byte.is_ascii_whitespace()) {
         Some(b'n') => RawValueKind::Null,
@@ -308,6 +308,19 @@ pub(crate) fn from_raw_value<T: serde::de::DeserializeOwned>(
     raw: &JsonRawValue,
 ) -> Result<T, JsonError> {
     imp::from_raw_value(raw)
+}
+
+pub(crate) fn from_str_borrowed<'de, T: serde::Deserialize<'de>>(
+    text: &'de str,
+) -> Result<T, JsonError> {
+    #[cfg(feature = "backend-serde-json")]
+    {
+        serde_json::from_str(text)
+    }
+    #[cfg(feature = "backend-sonic")]
+    {
+        sonic_rs::from_str(text)
+    }
 }
 
 /// Parse raw bytes into a value or typed structure.
@@ -386,6 +399,46 @@ pub(crate) fn split_array(
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_value_roundtrips_escaped_utf8_and_nested_values() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Payload {
+            text: String,
+            items: Vec<Option<i64>>,
+        }
+
+        let payload = Payload {
+            text: "\u{00e9}\u{1f680}\n\"\\\t".into(),
+            items: vec![Some(i64::MIN), None, Some(i64::MAX)],
+        };
+        let raw = to_raw_value(&payload).unwrap();
+        assert_eq!(to_vec(&raw).unwrap(), to_vec(&payload).unwrap());
+        for _ in 0..2 {
+            assert_eq!(from_raw_value::<Payload>(&raw).unwrap(), payload);
+        }
+        assert_eq!(to_vec(&raw).unwrap(), to_vec(&payload).unwrap());
+    }
+
+    #[test]
+    fn raw_value_preserves_serialization_errors() {
+        let invalid_keys = std::collections::BTreeMap::from([(vec![1, 2], true)]);
+        assert!(to_raw_value(&invalid_keys).is_err());
+    }
+
+    #[test]
+    fn raw_value_classifies_scalar_roots() {
+        for input in [b"null".as_slice(), b"true", b"false", b"1", br#""text""#] {
+            let value: Value = from_slice(input).unwrap();
+            let raw = to_raw_value(&value).unwrap();
+            if input == b"null" {
+                assert!(matches!(raw_value_kind(&raw), RawValueKind::Null));
+            } else {
+                assert!(matches!(raw_value_kind(&raw), RawValueKind::Scalar));
+            }
+            assert_eq!(to_vec(&raw).unwrap(), to_vec(&value).unwrap());
+        }
+    }
 
     #[test]
     fn split_array_retains_only_configured_items() {

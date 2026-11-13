@@ -60,6 +60,14 @@ fn spec_router() -> Router<()> {
 async fn call(router: &Router<()>, input: &[u8]) -> String {
     let out = router.handle_bytes(input).await;
     let bytes = out.to_bytes().unwrap().expect("expected a response body");
+    let shared = router
+        .handle_shared_bytes(bytes::Bytes::copy_from_slice(input))
+        .await;
+    assert_eq!(
+        shared.to_bytes().unwrap().as_deref(),
+        Some(bytes.as_slice()),
+        "shared dispatch differs"
+    );
     String::from_utf8(bytes).unwrap()
 }
 
@@ -68,6 +76,13 @@ async fn call_empty(router: &Router<()>, input: &[u8]) {
     let out = router.handle_bytes(input).await;
     assert!(matches!(out, Output::Empty), "expected no response");
     assert!(out.to_bytes().unwrap().is_none());
+    let shared = router
+        .handle_shared_bytes(bytes::Bytes::copy_from_slice(input))
+        .await;
+    assert!(
+        matches!(shared, Output::Empty),
+        "expected no shared response"
+    );
 }
 
 #[tokio::test]

@@ -27,7 +27,7 @@ backend-serde-json = ["dep:serde_json"]
 backend-sonic = ["dep:sonic-rs"]
 
 # --- Library layers ---
-server = []
+server = ["dep:bytes"]
 client = ["dep:bytes"]
 transport = []
 

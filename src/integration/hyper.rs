@@ -71,7 +71,7 @@ where
         }
     };
 
-    let HttpOutcome { status, body } = http::dispatch_with_context(&router, &body, ctx).await;
+    let HttpOutcome { status, body } = http::dispatch_with_context(&router, body, ctx).await;
     if status == 204 {
         Ok(HttpResponse::builder()
             .status(StatusCode::NO_CONTENT)
@@ -222,6 +222,34 @@ mod tests {
         serve_request(router.clone(), req, DEFAULT_MAX_REQUEST_BODY_SIZE)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_body_is_shared_with_borrowed_params() {
+        #[derive(serde::Deserialize)]
+        struct Params<'a> {
+            data: &'a str,
+        }
+        let body = Bytes::from_static(
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"YWJj"},"id":1}"#,
+        );
+        let offset = body.windows(4).position(|bytes| bytes == b"YWJj").unwrap();
+        let expected = body[offset..].as_ptr() as usize;
+        let router =
+            Router::with_state(expected).register("ingest", |expected, req: Request| async move {
+                let params: Params<'_> = req
+                    .params_as_borrowed()
+                    .map_err(|error| crate::Error::invalid_params().with_data(error.to_string()))?;
+                assert_eq!(params.data.as_ptr() as usize, expected);
+                tokio::task::yield_now().await;
+                Ok(params.data.len())
+            });
+        let request = HttpRequest::builder().body(Full::new(body)).unwrap();
+        let response = serve_test_request(&router, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let response: crate::Response = crate::json::from_slice(&body).unwrap();
+        assert_eq!(response.result_as::<usize>().unwrap(), 4);
     }
 
     #[tokio::test]

@@ -119,7 +119,7 @@ where
             };
 
             let HttpOutcome { status, body } =
-                http::dispatch_with_context(&router, &body, ctx).await;
+                http::dispatch_with_context(&router, body, ctx).await;
             if status == 204 {
                 Ok(HttpResponse::builder()
                     .status(StatusCode::NO_CONTENT)

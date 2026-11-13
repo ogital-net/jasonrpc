@@ -246,6 +246,40 @@ fn normalize_params<P: Serialize>(params: &P) -> Result<Option<JsonRawValue>, Js
     }
 }
 
+#[derive(Clone, Debug)]
+enum RequestParams {
+    Owned(JsonRawValue),
+    #[cfg(feature = "server")]
+    Shared(bytes::Bytes),
+}
+
+impl Serialize for RequestParams {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Owned(raw) => raw.serialize(serializer),
+            #[cfg(feature = "server")]
+            Self::Shared(bytes) => {
+                let text = std::str::from_utf8(bytes).map_err(serde::ser::Error::custom)?;
+                let raw: crate::json::BorrowedRawValue<'_> =
+                    crate::json::from_str_borrowed(text).map_err(serde::ser::Error::custom)?;
+                raw.serialize(serializer)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+fn de_shared_params<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::json::BorrowedRawValue<'de>>, D::Error> {
+    let raw = crate::json::BorrowedRawValue::deserialize(deserializer)?;
+    let text = crate::json::borrowed_raw_text(&raw);
+    if crate::json::classify_raw_value(text.as_bytes()) != crate::json::RawValueKind::Structured {
+        return Err(de::Error::custom("params must be an array or object"));
+    }
+    Ok(Some(raw))
+}
+
 /// The JSON-RPC 2.0 error object (a protocol value, distinct from a Rust error).
 ///
 /// ```
@@ -452,9 +486,12 @@ pub struct Request {
     /// Parameters as raw JSON. Use [`params_as`](Self::params_as) to
     /// deserialize into a concrete type.
     #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<JsonRawValue>,
+    params: Option<RequestParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<Id>,
+    #[cfg(feature = "backend-sonic")]
+    #[serde(skip)]
+    params_text: std::sync::OnceLock<std::sync::Arc<String>>,
 }
 
 impl<'de> Deserialize<'de> for Request {
@@ -483,8 +520,10 @@ impl<'de> Deserialize<'de> for Request {
                 Ok(Request {
                     jsonrpc: fields.jsonrpc,
                     method: fields.method,
-                    params: fields.params,
+                    params: fields.params.map(RequestParams::Owned),
                     id: fields.id,
+                    #[cfg(feature = "backend-sonic")]
+                    params_text: std::sync::OnceLock::new(),
                 })
             }
         }
@@ -494,6 +533,42 @@ impl<'de> Deserialize<'de> for Request {
 }
 
 impl Request {
+    #[cfg(feature = "server")]
+    pub(crate) fn from_shared_bytes(bytes: bytes::Bytes) -> Result<Self, JsonError> {
+        #[derive(Deserialize)]
+        struct Fields<'a> {
+            jsonrpc: Version,
+            method: String,
+            #[serde(default, borrow, deserialize_with = "de_shared_params")]
+            params: Option<crate::json::BorrowedRawValue<'a>>,
+            #[serde(default, deserialize_with = "de_present_id")]
+            id: Option<Id>,
+        }
+
+        let text = std::str::from_utf8(&bytes).map_err(<JsonError as de::Error>::custom)?;
+        if !text.trim_start().starts_with('{') {
+            return Err(<JsonError as de::Error>::custom(
+                "expected a JSON-RPC request object",
+            ));
+        }
+        let fields: Fields<'_> = crate::json::from_str_borrowed(text)?;
+        let params = fields.params.as_ref().map(|raw| {
+            let text = crate::json::borrowed_raw_text(raw);
+            RequestParams::Shared(match text {
+                std::borrow::Cow::Borrowed(text) => bytes.slice_ref(text.as_bytes()),
+                std::borrow::Cow::Owned(text) => bytes::Bytes::from(text),
+            })
+        });
+        Ok(Self {
+            jsonrpc: fields.jsonrpc,
+            method: fields.method,
+            params,
+            id: fields.id,
+            #[cfg(feature = "backend-sonic")]
+            params_text: std::sync::OnceLock::new(),
+        })
+    }
+
     /// Build a request that expects a response.
     ///
     /// The `params` argument is serialized to JSON bytes. Pass `()` for a
@@ -507,8 +582,13 @@ impl Request {
         Self {
             jsonrpc: Version,
             method: method.into(),
-            params: normalize_params(params).ok().flatten(),
+            params: normalize_params(params)
+                .ok()
+                .flatten()
+                .map(RequestParams::Owned),
             id: Some(id),
+            #[cfg(feature = "backend-sonic")]
+            params_text: std::sync::OnceLock::new(),
         }
     }
 
@@ -528,8 +608,10 @@ impl Request {
         Ok(Self {
             jsonrpc: Version,
             method: method.into(),
-            params: normalize_params(params)?,
+            params: normalize_params(params)?.map(RequestParams::Owned),
             id: Some(id),
+            #[cfg(feature = "backend-sonic")]
+            params_text: std::sync::OnceLock::new(),
         })
     }
 
@@ -540,8 +622,13 @@ impl Request {
         Self {
             jsonrpc: Version,
             method: method.into(),
-            params: normalize_params(params).ok().flatten(),
+            params: normalize_params(params)
+                .ok()
+                .flatten()
+                .map(RequestParams::Owned),
             id: None,
+            #[cfg(feature = "backend-sonic")]
+            params_text: std::sync::OnceLock::new(),
         }
     }
 
@@ -560,8 +647,10 @@ impl Request {
         Ok(Self {
             jsonrpc: Version,
             method: method.into(),
-            params: normalize_params(params)?,
+            params: normalize_params(params)?.map(RequestParams::Owned),
             id: None,
+            #[cfg(feature = "backend-sonic")]
+            params_text: std::sync::OnceLock::new(),
         })
     }
 
@@ -600,9 +689,90 @@ impl Request {
     /// relative to the params JSON, not the full request body.
     pub fn params_as<T: serde::de::DeserializeOwned>(&self) -> Result<T, JsonError> {
         match &self.params {
-            Some(raw) => crate::json::from_raw_value(raw),
+            Some(RequestParams::Owned(raw)) => crate::json::from_raw_value(raw),
+            #[cfg(feature = "server")]
+            Some(RequestParams::Shared(bytes)) => {
+                let text = std::str::from_utf8(bytes).map_err(<JsonError as de::Error>::custom)?;
+                crate::json::from_str_borrowed(text)
+            }
             None => crate::json::from_slice::<T>(b"null"),
         }
+    }
+
+    /// Deserialize params while allowing the result to borrow from this request.
+    ///
+    /// Unescaped strings can be borrowed with `&str` or `#[serde(borrow)]`
+    /// `Cow<str>`. Escaped strings require an owned value; `Cow<str>` provides
+    /// that fallback. Missing params are deserialized as JSON `null`.
+    ///
+    /// Requests dispatched from shared `Bytes` borrow directly on both backends.
+    /// Other requests borrow stored raw JSON with serde-json; Sonic caches a
+    /// serialized copy on the first call. Keep the request alive while using
+    /// borrowed values, including across an await.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's native JSON error if params cannot be decoded.
+    /// Error locations are relative to the params, not the request envelope.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), jasonrpc::json::JsonError> {
+    /// use jasonrpc::{Id, Request};
+    /// use std::borrow::Cow;
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct Attachment<'a> {
+    ///     #[serde(borrow)]
+    ///     data: Cow<'a, str>,
+    /// }
+    ///
+    /// #[derive(serde::Serialize)]
+    /// struct Payload { data: &'static str }
+    ///
+    /// let request = Request::call("ingest", &Payload { data: "YWJj" }, Id::Number(1));
+    /// let params: Attachment<'_> = request.params_as_borrowed()?;
+    /// assert_eq!(params.data, "YWJj");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Borrowed values cannot outlive the request:
+    ///
+    /// ```compile_fail
+    /// use jasonrpc::{Id, Request};
+    /// let data;
+    /// {
+    ///     let request = Request::call("ingest", &("YWJj",), Id::Number(1));
+    ///     let (value,): (&str,) = request.params_as_borrowed().unwrap();
+    ///     data = value;
+    /// }
+    /// println!("{data}");
+    /// ```
+    pub fn params_as_borrowed<'a, T: serde::Deserialize<'a>>(&'a self) -> Result<T, JsonError> {
+        #[cfg(feature = "server")]
+        if let Some(RequestParams::Shared(bytes)) = &self.params {
+            let text = std::str::from_utf8(bytes).map_err(<JsonError as de::Error>::custom)?;
+            return crate::json::from_str_borrowed(text);
+        }
+        let Some(RequestParams::Owned(raw)) = &self.params else {
+            return crate::json::from_str_borrowed("null");
+        };
+        #[cfg(feature = "backend-serde-json")]
+        let text = raw.get();
+        #[cfg(feature = "backend-sonic")]
+        let text = {
+            if self.params_text.get().is_none() {
+                let bytes = crate::json::to_vec(raw)?;
+                let text =
+                    String::from_utf8(bytes).map_err(<JsonError as serde::de::Error>::custom)?;
+                let _ = self.params_text.set(std::sync::Arc::new(text));
+            }
+            self.params_text
+                .get()
+                .expect("params text initialized")
+                .as_str()
+        };
+        crate::json::from_str_borrowed(text)
     }
 
     /// Deserialize a single positional parameter.
@@ -1102,6 +1272,108 @@ mod tests {
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":["x"],"id":1}"#)
                 .unwrap();
         assert!(req.param_as::<i64>().is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn shared_params_preserve_raw_json_and_validate_envelopes() {
+        let body = bytes::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{ "n": 123456789012345678901234567890, "s": "\u0061", "f": 1.2300 },"id":null}"#,
+        );
+        let request = Request::from_shared_bytes(body).unwrap();
+        let bytes = crate::json::to_vec(&request).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains(r#"{ "n": 123456789012345678901234567890, "s": "\u0061", "f": 1.2300 }"#)
+        );
+        assert!(!request.is_notification());
+        for input in [
+            br#"["2.0","ingest",{},1]"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"ingest","params":null}"#,
+            br#"{"jsonrpc":"2.0","method":"ingest","params":3}"#,
+            br#"{"jsonrpc":"2.0","method":"ingest","method":"other"}"#,
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{},"params":{}}"#,
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"\q"}}"#,
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"ingest\",\"extra\":\"\xff\"}",
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"ingest\",\"params\":{\"data\":\"raw\nnewline\"}}",
+            br#"{"jsonrpc":"2.0","method":"ingest"} true"#,
+        ] {
+            assert!(
+                Request::from_shared_bytes(bytes::Bytes::copy_from_slice(input)).is_err(),
+                "accepted {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn shared_params_borrow_from_the_original_body() {
+        #[derive(Deserialize)]
+        struct Params<'a> {
+            data: &'a str,
+        }
+        let body = bytes::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"YWJj"},"id":1}"#,
+        );
+        let offset = body.windows(4).position(|bytes| bytes == b"YWJj").unwrap();
+        let request = Request::from_shared_bytes(body.clone()).unwrap();
+        let params: Params<'_> = request.params_as_borrowed().unwrap();
+        assert_eq!(params.data.as_ptr(), body[offset..].as_ptr());
+        let clone = request.clone();
+        let cloned: Params<'_> = clone.params_as_borrowed().unwrap();
+        assert_eq!(cloned.data.as_ptr(), params.data.as_ptr());
+        assert_eq!(crate::json::to_vec(&request).unwrap(), body.as_ref());
+        drop(body);
+        assert_eq!(params.data, "YWJj");
+    }
+
+    #[test]
+    fn params_as_borrowed_borrows_and_preserves_requests() {
+        #[derive(Deserialize)]
+        struct Params<'a> {
+            #[serde(borrow)]
+            data: std::borrow::Cow<'a, str>,
+        }
+
+        let request: Request = crate::json::from_slice(
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"YWJj"},"id":1}"#,
+        )
+        .unwrap();
+        let before = crate::json::to_vec(&request).unwrap();
+        let first: Params<'_> = request.params_as_borrowed().unwrap();
+        let second: Params<'_> = request.params_as_borrowed().unwrap();
+        assert!(matches!(first.data, std::borrow::Cow::Borrowed("YWJj")));
+        assert_eq!(first.data.as_ptr(), second.data.as_ptr());
+        assert_eq!(crate::json::to_vec(&request).unwrap(), before);
+    }
+
+    #[test]
+    fn params_as_borrowed_handles_escapes_missing_and_errors() {
+        #[derive(Debug, Deserialize)]
+        struct Params<'a> {
+            #[serde(borrow)]
+            data: std::borrow::Cow<'a, str>,
+        }
+
+        let request: Request = crate::json::from_slice(
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"YW\u004aj"},"id":1}"#,
+        )
+        .unwrap();
+        let params: Params<'_> = request.params_as_borrowed().unwrap();
+        assert!(matches!(params.data, std::borrow::Cow::Owned(_)));
+        assert_eq!(params.data, "YWJj");
+
+        let request = Request::call("ingest", &(), Id::Number(1));
+        assert_eq!(request.params_as_borrowed::<Option<&str>>().unwrap(), None);
+        assert!(request.params_as_borrowed::<Params<'_>>().is_err());
+        let request: Request = crate::json::from_slice(
+            br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":123},"id":1}"#,
+        )
+        .unwrap();
+        let error = request.params_as_borrowed::<Params<'_>>().unwrap_err();
+        assert!(error.to_string().contains("expected a string"));
+        assert_eq!(error.line(), 1);
+        assert!(error.column() > 0);
     }
 
     #[test]
