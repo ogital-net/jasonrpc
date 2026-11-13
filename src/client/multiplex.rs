@@ -8,7 +8,7 @@
 //! - A background **reader task** owns the read half of the connection. It loops
 //!   decoding frames, parses the `id` out of each response, and routes the raw
 //!   bytes to whoever is waiting for that id.
-//! - A **pending map** (`HashMap<Id, oneshot::Sender<Vec<u8>>>`) records, for
+//! - A **pending map** (`HashMap<Id, oneshot::Sender<ReceivedResponse>>`) records, for
 //!   each in-flight request, a one-shot channel to deliver its reply. Each call
 //!   registers its id *before* writing, so a fast reply can't arrive before the
 //!   waiter is recorded.
@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
-use super::Transport;
+use super::{ReceivedResponse, Transport};
 use crate::json;
 use crate::protocol::Id;
 use crate::transport::io::{FramedReader, FramedWriter, DEFAULT_MAX_FRAME_SIZE};
@@ -87,7 +87,7 @@ impl From<crate::error::TransportError> for MultiplexError {
 
 struct ConnectionState {
     connected: bool,
-    pending: HashMap<Id, oneshot::Sender<Vec<u8>>>,
+    pending: HashMap<Id, oneshot::Sender<ReceivedResponse>>,
     closed: watch::Sender<bool>,
 }
 
@@ -100,6 +100,15 @@ impl ConnectionState {
 }
 
 type SharedState = Arc<Mutex<ConnectionState>>;
+
+struct ReaderStateGuard(SharedState);
+
+impl Drop for ReaderStateGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.disconnect();
+    }
+}
 
 /// RAII guard that removes a call's id from the pending map when dropped.
 ///
@@ -239,7 +248,7 @@ where
         let reader = FramedReader::new(read_half, framing).with_max_frame_size(max_frame_size);
         let reader_task = Arc::new(ReaderTaskGuard(tokio::spawn(reader_loop(
             reader,
-            Arc::clone(&state),
+            ReaderStateGuard(Arc::clone(&state)),
         ))));
 
         MultiplexTransport {
@@ -252,18 +261,25 @@ where
 
 /// The background reader: pull frames, parse ids, deliver to waiters. On any
 /// end-of-stream or error, drop all waiters (their receivers resolve to Err).
-async fn reader_loop<R, F>(mut reader: FramedReader<R, F>, state: SharedState)
+async fn reader_loop<R, F>(mut reader: FramedReader<R, F>, guard: ReaderStateGuard)
 where
     R: AsyncRead + Unpin,
     F: Framing,
 {
+    let state = &guard.0;
     loop {
-        if let Ok(Some(frame)) = reader.recv().await {
-            if let Some(id) = parse_id(&frame) {
-                let waiter = state.lock().unwrap().pending.remove(&id);
+        if let Ok(Some(frame)) = reader.recv_bytes().await {
+            let response = ReceivedResponse::parsed(frame);
+            let fallback_id = if response.routing_id().is_none() {
+                parse_id(response.as_bytes())
+            } else {
+                None
+            };
+            if let Some(id) = response.routing_id().or(fallback_id.as_ref()) {
+                let waiter = state.lock().unwrap().pending.remove(id);
                 if let Some(tx) = waiter {
                     // Ignore send error: the caller may have gone away.
-                    let _ = tx.send(frame);
+                    let _ = tx.send(response);
                 }
                 // No waiter: a stray/duplicate response; drop it.
             }
@@ -271,10 +287,6 @@ where
             // that we can't attribute) is dropped; the affected caller will
             // time out or fail when the connection ends.
         } else {
-            // Marking the connection dead and clearing waiters under the same
-            // lock makes teardown atomic with new waiter registration.
-            let mut state = state.lock().unwrap();
-            state.disconnect();
             return;
         }
     }
@@ -301,6 +313,20 @@ where
         // reply. `Client` always includes one for calls.
         let id = parse_id(&request).ok_or(MultiplexError::MissingId)?;
 
+        self.round_trip_with_id(request, id).await
+    }
+
+    async fn round_trip_with_id(&self, request: Vec<u8>, id: Id) -> Result<Vec<u8>, Self::Error> {
+        self.round_trip_response(request, id)
+            .await
+            .map(ReceivedResponse::into_bytes)
+    }
+
+    async fn round_trip_response(
+        &self,
+        request: Vec<u8>,
+        id: Id,
+    ) -> Result<ReceivedResponse, Self::Error> {
         let (tx, rx) = oneshot::channel();
 
         // Register the waiter BEFORE writing, so a fast reply can't race us.
@@ -369,7 +395,8 @@ where
     }
 
     /// Wait until the connection becomes unusable through EOF, a framing or
-    /// I/O error, or cancellation of an in-progress frame write.
+    /// I/O error, cancellation of an in-progress frame write, or termination of
+    /// the background reader task.
     ///
     /// Returns immediately if already closed. Multiple concurrent waiters are
     /// supported, and cancelling this wait does not affect the connection.
@@ -480,6 +507,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_ids_correlate() {
+        use crate::transport::io::FramedConn;
+
+        for id in [
+            Id::Number(-1),
+            Id::Unsigned(i64::MAX as u64 + 1),
+            Id::String("known".into()),
+            Id::Null,
+        ] {
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            let transport = MultiplexTransport::new(client_io, Netstring);
+            let (request, id) = crate::client::encode_call("m", &(), id).unwrap();
+            let expected_request = request.clone();
+            let response = json::to_vec(&crate::Response::result(id.clone(), 7)).unwrap();
+            let server = tokio::spawn(async move {
+                let mut conn = FramedConn::new(server_io, Netstring);
+                assert_eq!(conn.recv().await.unwrap().unwrap(), expected_request);
+                conn.send(&response).await.unwrap();
+            });
+
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                transport.round_trip_with_id(request, id.clone()),
+            )
+            .await
+            .expect("known-id calls must receive their response")
+            .unwrap();
+            assert_eq!(crate::client::decode_result::<i64>(&reply, &id).unwrap(), 7);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_round_trip_preserves_malformed_response_bytes() {
+        use crate::transport::io::FramedConn;
+
+        for response in [
+            br#"{ "id":7, "result":42, "jsonrpc":"2.0" }"#.as_slice(),
+            br#"{"jsonrpc":"1.0","result":42,"id":7}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","result":42,"error":null,"id":7}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":7}"#.as_slice(),
+        ] {
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            let transport = MultiplexTransport::new(client_io, Netstring);
+            let server = tokio::spawn(async move {
+                let mut conn = FramedConn::new(server_io, Netstring);
+                conn.recv().await.unwrap().unwrap();
+                conn.send(response).await.unwrap();
+            });
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                transport.round_trip(br#"{"jsonrpc":"2.0","method":"m","id":7}"#.to_vec()),
+            )
+            .await
+            .expect("recoverable ids must route malformed envelopes")
+            .unwrap();
+            assert_eq!(reply, response);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn dropping_last_transport_closes_connection() {
         use tokio::io::AsyncReadExt;
 
@@ -535,6 +624,126 @@ mod tests {
         let err = client.call::<_, String>("whatever", ()).await.unwrap_err();
         // Should surface as a transport error, not hang.
         assert!(matches!(err, crate::error::ClientError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_response_does_not_strand_pending_calls() {
+        use crate::transport::io::FramedConn;
+
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let transport = MultiplexTransport::new(client_io, Netstring);
+        let mut first = Box::pin(transport.round_trip_response(
+            br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec(),
+            Id::Number(1),
+        ));
+        let mut second = Box::pin(transport.round_trip_response(
+            br#"{"jsonrpc":"2.0","method":"m","id":2}"#.to_vec(),
+            Id::Number(2),
+        ));
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+        assert_eq!(transport.pending_len(), 2);
+
+        let mut peer = FramedConn::new(server_io, Netstring);
+        peer.recv().await.unwrap().unwrap();
+        peer.recv().await.unwrap().unwrap();
+        peer.send(b"{\"jsonrpc\":\"2.0\",\"result\":\"\xff\",\"id\":1}")
+            .await
+            .unwrap();
+        drop(peer);
+
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("invalid UTF-8 followed by EOF must not strand pending calls");
+        match first {
+            Ok(response) => assert!(matches!(
+                response.decode::<String>(&Id::Number(1)),
+                Err(crate::error::ClientError::Protocol(_))
+            )),
+            Err(error) => assert!(matches!(error, MultiplexError::ConnectionClosed)),
+        }
+        assert!(matches!(second, Err(MultiplexError::ConnectionClosed)));
+        assert!(!transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), transport.closed())
+            .await
+            .expect("invalid UTF-8 followed by EOF must notify closure");
+    }
+
+    #[tokio::test]
+    async fn reader_cancellation_disconnects_and_fails_pending_calls() {
+        for poll_reader in [false, true] {
+            let (client_io, _server_io) = tokio::io::duplex(1024);
+            let transport = MultiplexTransport::new(client_io, Netstring);
+            let mut call = Box::pin(transport.round_trip_with_id(
+                br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec(),
+                Id::Number(1),
+            ));
+            assert_pending(call.as_mut()).await;
+            assert_eq!(transport.pending_len(), 1);
+            if poll_reader {
+                tokio::task::yield_now().await;
+            }
+            transport.reader_task.0.abort();
+
+            let error = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+                .await
+                .expect("reader cancellation must wake pending calls")
+                .unwrap_err();
+            assert!(matches!(error, MultiplexError::ConnectionClosed));
+            assert!(!transport.is_connected());
+            assert_eq!(transport.pending_len(), 0);
+            tokio::time::timeout(std::time::Duration::from_secs(1), transport.closed())
+                .await
+                .expect("reader cancellation must notify closure");
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_panic_disconnects_and_fails_pending_calls() {
+        use crate::transport::io::FramedConn;
+
+        #[derive(Clone)]
+        struct PanickingFraming;
+
+        impl Framing for PanickingFraming {
+            fn encode(&self, payload: &[u8], dst: &mut Vec<u8>) {
+                Netstring.encode(payload, dst);
+            }
+
+            fn decode(
+                &self,
+                src: &[u8],
+            ) -> Result<Option<(Vec<u8>, usize)>, crate::error::TransportError> {
+                assert!(src.is_empty(), "injected reader panic");
+                Ok(None)
+            }
+        }
+
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let transport = MultiplexTransport::new(client_io, PanickingFraming);
+        let mut call = Box::pin(transport.round_trip_with_id(
+            br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec(),
+            Id::Number(1),
+        ));
+        assert_pending(call.as_mut()).await;
+        assert_eq!(transport.pending_len(), 1);
+        let mut peer = FramedConn::new(server_io, Netstring);
+        peer.recv().await.unwrap().unwrap();
+        peer.send(b"panic").await.unwrap();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("reader panic must wake pending calls")
+            .unwrap_err();
+        assert!(matches!(error, MultiplexError::ConnectionClosed));
+        assert!(!transport.is_connected());
+        assert_eq!(transport.pending_len(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(1), transport.closed())
+            .await
+            .expect("reader panic must notify closure");
     }
 
     #[tokio::test]
@@ -616,7 +825,10 @@ mod tests {
 
         // Issue a call and cancel it via a timeout. The round_trip future is
         // dropped mid-await; the guard must remove the pending entry.
-        let fut = transport.round_trip(br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec());
+        let fut = transport.round_trip_with_id(
+            br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec(),
+            Id::Number(1),
+        );
         let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         assert!(timed_out.is_err(), "call should have timed out");
 
@@ -755,9 +967,10 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(1024);
         let transport = MultiplexTransport::new(client_io, Netstring);
         let writer_lock = transport.writer.lock().await;
-        let mut queued = Box::pin(
-            transport.round_trip(br#"{"jsonrpc":"2.0","method":"first","id":100}"#.to_vec()),
-        );
+        let mut queued = Box::pin(transport.round_trip_with_id(
+            br#"{"jsonrpc":"2.0","method":"first","id":100}"#.to_vec(),
+            Id::Number(100),
+        ));
         assert_pending(queued.as_mut()).await;
         assert_eq!(transport.pending_len(), 1);
         drop(queued);
@@ -775,9 +988,10 @@ mod tests {
     async fn cancelled_response_wait_keeps_connection_usable() {
         let (client_io, server_io) = tokio::io::duplex(1024);
         let transport = MultiplexTransport::new(client_io, Netstring);
-        let mut waiting_reply = Box::pin(
-            transport.round_trip(br#"{"jsonrpc":"2.0","method":"first","id":100}"#.to_vec()),
-        );
+        let mut waiting_reply = Box::pin(transport.round_trip_with_id(
+            br#"{"jsonrpc":"2.0","method":"first","id":100}"#.to_vec(),
+            Id::Number(100),
+        ));
         assert_pending(waiting_reply.as_mut()).await;
         drop(waiting_reply);
 
@@ -802,7 +1016,11 @@ mod tests {
         let first_transport = transport.clone();
         let request = br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec();
         let first_request = request.clone();
-        let first = tokio::spawn(async move { first_transport.round_trip(first_request).await });
+        let first = tokio::spawn(async move {
+            first_transport
+                .round_trip_with_id(first_request, Id::Number(1))
+                .await
+        });
 
         while transport.pending_len() == 0 {
             tokio::task::yield_now().await;

@@ -47,6 +47,11 @@ mod imp {
         serde_json::to_vec(v)
     }
 
+    #[cfg(feature = "client")]
+    pub fn to_writer<T: serde::Serialize>(writer: &mut Vec<u8>, v: &T) -> Result<(), JsonError> {
+        serde_json::to_writer(writer, v)
+    }
+
     pub fn null() -> Value {
         Value::Null
     }
@@ -129,6 +134,11 @@ mod imp {
 
     pub fn to_vec<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, JsonError> {
         sonic_rs::to_vec(v)
+    }
+
+    #[cfg(feature = "client")]
+    pub fn to_writer<T: serde::Serialize>(writer: &mut Vec<u8>, v: &T) -> Result<(), JsonError> {
+        sonic_rs::to_writer(writer, v)
     }
 
     pub fn null() -> Value {
@@ -237,6 +247,37 @@ pub type JsonRawValue = Box<serde_json::value::RawValue>;
 #[cfg(feature = "backend-sonic")]
 pub type JsonRawValue = sonic_rs::OwnedLazyValue;
 
+#[cfg(all(feature = "client", feature = "tokio", feature = "backend-serde-json"))]
+pub(crate) type BorrowedRawValue<'a> = &'a serde_json::value::RawValue;
+#[cfg(all(feature = "client", feature = "tokio", feature = "backend-sonic"))]
+pub(crate) type BorrowedRawValue<'a> = sonic_rs::LazyValue<'a>;
+
+#[cfg(all(feature = "client", feature = "tokio"))]
+pub(crate) fn from_slice_borrowed<'de, T: serde::Deserialize<'de>>(
+    bytes: &'de [u8],
+) -> Result<T, JsonError> {
+    #[cfg(feature = "backend-serde-json")]
+    {
+        serde_json::from_slice(bytes)
+    }
+    #[cfg(feature = "backend-sonic")]
+    {
+        sonic_rs::from_slice(bytes)
+    }
+}
+
+#[cfg(all(feature = "client", feature = "tokio"))]
+pub(crate) fn borrowed_raw_text<'a>(raw: &'a BorrowedRawValue<'_>) -> std::borrow::Cow<'a, str> {
+    #[cfg(feature = "backend-serde-json")]
+    {
+        std::borrow::Cow::Borrowed(raw.get())
+    }
+    #[cfg(feature = "backend-sonic")]
+    {
+        raw.as_raw_cow()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RawValueKind {
     Null,
@@ -244,8 +285,8 @@ pub(crate) enum RawValueKind {
     Scalar,
 }
 
-#[cfg(feature = "backend-serde-json")]
-fn classify_raw_value(bytes: &[u8]) -> RawValueKind {
+#[cfg(any(feature = "backend-serde-json", feature = "client"))]
+pub(crate) fn classify_raw_value(bytes: &[u8]) -> RawValueKind {
     match bytes.iter().find(|byte| !byte.is_ascii_whitespace()) {
         Some(b'n') => RawValueKind::Null,
         Some(b'[' | b'{') => RawValueKind::Structured,
@@ -309,6 +350,11 @@ pub fn from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Jso
 /// ```
 pub fn to_vec<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, JsonError> {
     imp::to_vec(v)
+}
+
+#[cfg(feature = "client")]
+pub(crate) fn to_writer<T: serde::Serialize>(writer: &mut Vec<u8>, v: &T) -> Result<(), JsonError> {
+    imp::to_writer(writer, v)
 }
 
 /// Construct a JSON `null` [`Value`].

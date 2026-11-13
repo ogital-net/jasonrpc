@@ -30,8 +30,11 @@ use std::time::Duration;
 
 use tokio::net::UnixStream;
 
-use super::{Client, MultiplexError, MultiplexOver, MultiplexTransport, Transport};
+use super::{
+    Client, MultiplexError, MultiplexOver, MultiplexTransport, ReceivedResponse, Transport,
+};
 use crate::error::TransportError;
+use crate::protocol::Id;
 use crate::transport::Framing;
 
 /// Policy governing how the UDS client re-dials a dropped connection.
@@ -197,6 +200,20 @@ where
         // replaying: the request may already have executed on the server. The
         // next call will observe the dead connection and reconnect.
         transport.round_trip(request).await
+    }
+
+    async fn round_trip_with_id(&self, request: Vec<u8>, id: Id) -> Result<Vec<u8>, Self::Error> {
+        let transport = self.ensure_connected().await?;
+        transport.round_trip_with_id(request, id).await
+    }
+
+    async fn round_trip_response(
+        &self,
+        request: Vec<u8>,
+        id: Id,
+    ) -> Result<ReceivedResponse, Self::Error> {
+        let transport = self.ensure_connected().await?;
+        transport.round_trip_response(request, id).await
     }
 
     async fn send_notification(&self, notification: Vec<u8>) -> Result<(), Self::Error> {

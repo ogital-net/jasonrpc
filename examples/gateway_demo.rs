@@ -35,8 +35,8 @@
 //! whose correlation map is keyed by id. So the gateway rewrites each inbound id
 //! to a process-unique id before forwarding, then restores the original id on
 //! the way back. The upstream connection is a [`UdsClient`]; its raw byte
-//! passthrough ([`round_trip_raw`](jasonrpc::client::Client::round_trip_raw))
-//! forwards a request without re-parsing it.
+//! passthrough ([`round_trip_raw_with_id`](jasonrpc::client::Client::round_trip_raw_with_id))
+//! forwards a request with its known id without re-parsing it.
 
 #![allow(clippy::ignored_unit_patterns)]
 
@@ -148,7 +148,11 @@ impl Gateway {
         req.set_id(gw_id.clone());
 
         let request_bytes = json::to_vec(&req).unwrap_or_default();
-        match self.upstream.round_trip_raw(request_bytes).await {
+        match self
+            .upstream
+            .round_trip_raw_with_id(request_bytes, gw_id)
+            .await
+        {
             Ok(reply) => {
                 // Restore the caller's original id before returning.
                 match json::from_slice::<Response>(&reply) {

@@ -26,6 +26,7 @@
 //! silently skip this target), the bench compiles without them and prints how
 //! to re-run.
 //! Enable `newline` as well to compare large newline and netstring framed reads.
+//! Enable `client` to include typed and byte-only multiplexed round trips.
 
 // When the needed features are missing, compile a tiny `main` that explains how
 // to run the benchmark, so `cargo bench` is never a silent no-op.
@@ -268,6 +269,277 @@ mod bench_impl {
         group.finish();
     }
 
+    #[cfg(feature = "client")]
+    fn bench_multiplex(c: &mut Criterion) {
+        use jasonrpc::client::{encode_call, Client, MultiplexTransport};
+        use jasonrpc::transport::io::FramedConn;
+        use jasonrpc::transport::Netstring;
+        use jasonrpc::{json, Id, Response};
+
+        #[derive(serde::Deserialize)]
+        struct IdOnly {
+            id: Id,
+        }
+
+        let rt = runtime();
+        let client = rt.block_on(async {
+            let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+            tokio::spawn(async move {
+                let mut conn = FramedConn::new(server_io, Netstring);
+                while let Some(frame) = conn.recv().await.unwrap() {
+                    let request: IdOnly = json::from_slice(&frame).unwrap();
+                    let response = Response::result(request.id, json::null());
+                    conn.send(&json::to_vec(&response).unwrap()).await.unwrap();
+                }
+            });
+            Client::new(MultiplexTransport::new(client_io, Netstring))
+        });
+
+        let mut group = c.benchmark_group("multiplex");
+        group.sample_size(50);
+        group.warm_up_time(std::time::Duration::from_secs(1));
+        group.measurement_time(std::time::Duration::from_secs(3));
+
+        for count in [0, 512, 32 * 1024] {
+            let params = vec![7_u64; count];
+            let (request, _) = encode_call("noop", &params, Id::Number(1)).unwrap();
+            group.throughput(Throughput::Bytes(request.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new("typed_call", count),
+                &params,
+                |bench, params| {
+                    bench.iter(|| {
+                        rt.block_on(client.call::<_, ()>("noop", std::hint::black_box(params)))
+                            .unwrap();
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("raw_call", count),
+                &request,
+                |bench, request| {
+                    bench.iter(|| {
+                        std::hint::black_box(
+                            rt.block_on(
+                                client.round_trip_raw(std::hint::black_box(request.clone())),
+                            )
+                            .unwrap(),
+                        );
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    #[cfg(not(feature = "client"))]
+    fn bench_multiplex(_c: &mut Criterion) {}
+
+    #[cfg(feature = "client")]
+    fn bench_receive(c: &mut Criterion) {
+        use jasonrpc::client::{decode_result, Client, MultiplexTransport};
+        use jasonrpc::transport::io::FramedConn;
+        use jasonrpc::transport::Netstring;
+        use jasonrpc::{json, Id, Response};
+
+        #[derive(serde::Deserialize)]
+        struct IdOnly {
+            id: Id,
+        }
+
+        let rt = runtime();
+        let mut group = c.benchmark_group("receive");
+        group.sample_size(50);
+        group.warm_up_time(std::time::Duration::from_secs(1));
+        group.measurement_time(std::time::Duration::from_secs(3));
+
+        for count in [0, 512, 32 * 1024] {
+            let result = vec![7_u64; count];
+            let response = Response::result(Id::Number(1), &result);
+            let bytes = json::to_vec(&response).unwrap();
+            group.throughput(Throughput::Bytes(bytes.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new("decode_result", count),
+                &bytes,
+                |bench, bytes| {
+                    bench.iter(|| {
+                        std::hint::black_box(
+                            decode_result::<Vec<u64>>(std::hint::black_box(bytes), &Id::Number(1))
+                                .unwrap(),
+                        );
+                    });
+                },
+            );
+
+            let client = rt.block_on(async {
+                let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+                tokio::spawn(async move {
+                    let mut conn = FramedConn::new(server_io, Netstring);
+                    let mut response = response;
+                    while let Some(frame) = conn.recv().await.unwrap() {
+                        let request: IdOnly = json::from_slice(&frame).unwrap();
+                        response.set_id(request.id);
+                        conn.send(&json::to_vec(&response).unwrap()).await.unwrap();
+                    }
+                });
+                Client::new(MultiplexTransport::new(client_io, Netstring))
+            });
+            group.bench_function(BenchmarkId::new("multiplex", count), |bench| {
+                bench.iter(|| {
+                    std::hint::black_box(
+                        rt.block_on(client.call::<_, Vec<u64>>("result", ()))
+                            .unwrap(),
+                    );
+                });
+            });
+        }
+
+        group.finish();
+    }
+
+    #[cfg(not(feature = "client"))]
+    fn bench_receive(_c: &mut Criterion) {}
+
+    #[cfg(feature = "client")]
+    fn allocation_profile(case: &str) {
+        use jasonrpc::client::{decode_result, encode_call, encode_notification};
+        use jasonrpc::{json, Id, Response};
+
+        let size = std::env::var("JASONRPC_ALLOC_SIZE")
+            .map(|size| {
+                size.parse::<usize>()
+                    .expect("invalid allocation payload size")
+            })
+            .unwrap_or(match case {
+                "batch" | "batch_notification" => 100,
+                _ => 32 * 1024,
+            });
+        let params = vec![7_u64; size];
+        let response = json::to_vec(&Response::result(Id::Number(1), &params)).unwrap();
+
+        if case == "multiplex" || case == "multiplex_raw" {
+            use jasonrpc::client::{Client, MultiplexTransport};
+            use jasonrpc::transport::io::FramedConn;
+            use jasonrpc::transport::Netstring;
+
+            #[derive(serde::Deserialize)]
+            struct IdOnly {
+                id: Id,
+            }
+
+            let rt = runtime();
+            let (request, _) = encode_call("noop", &params, Id::Number(1)).unwrap();
+            rt.block_on(async {
+                let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+                let server = tokio::spawn(async move {
+                    let mut conn = FramedConn::new(server_io, Netstring);
+                    while let Some(frame) = conn.recv().await.unwrap() {
+                        let request: IdOnly = json::from_slice(&frame).unwrap();
+                        let response = Response::result(request.id, ());
+                        conn.send(&json::to_vec(&response).unwrap()).await.unwrap();
+                    }
+                });
+                let client = Client::new(MultiplexTransport::new(client_io, Netstring));
+                for _ in 0..1000 {
+                    if case == "multiplex_raw" {
+                        std::hint::black_box(client.round_trip_raw(request.clone()).await.unwrap());
+                    } else {
+                        client.call::<_, ()>("noop", &params).await.unwrap();
+                    }
+                }
+                drop(client);
+                server.abort();
+                let _ = server.await;
+            });
+            return;
+        }
+
+        if matches!(
+            case,
+            "dispatch" | "batch" | "notification" | "notification_unknown" | "batch_notification"
+        ) {
+            let rt = runtime();
+            let router = bench_router();
+            let request = match case {
+                "dispatch" => {
+                    br#"{"jsonrpc":"2.0","method":"add","params":[42,23],"id":1}"#.to_vec()
+                }
+                "notification" => br#"{"jsonrpc":"2.0","method":"noop","params":[]}"#.to_vec(),
+                "notification_unknown" => {
+                    br#"{"jsonrpc":"2.0","method":"unknown","params":[]}"#.to_vec()
+                }
+                "batch_notification" => {
+                    let requests = vec![Request::notification("noop", &()); size];
+                    json::to_vec(&requests).unwrap()
+                }
+                _ => {
+                    let requests = vec![Request::call("add", &(42, 23), Id::Number(1)); size];
+                    json::to_vec(&requests).unwrap()
+                }
+            };
+            for _ in 0..1000 {
+                let output = rt.block_on(router.handle_bytes(&request));
+                std::hint::black_box(output.to_bytes().unwrap());
+            }
+            return;
+        }
+
+        if case == "framed_write" {
+            use jasonrpc::transport::io::FramedWriter;
+            use jasonrpc::transport::Netstring;
+
+            let rt = runtime();
+            let mut writer = FramedWriter::new(tokio::io::sink(), Netstring);
+            for _ in 0..1000 {
+                rt.block_on(writer.send(&response)).unwrap();
+            }
+            return;
+        }
+
+        if case == "framed_read" || case == "framed_read_shared" {
+            use jasonrpc::transport::io::FramedReader;
+            use jasonrpc::transport::{Framing, Netstring};
+
+            let rt = runtime();
+            let mut framed = Vec::new();
+            Netstring.encode(&response, &mut framed);
+            for _ in 0..1000 {
+                let mut reader = FramedReader::new(framed.as_slice(), Netstring);
+                if case == "framed_read_shared" {
+                    std::hint::black_box(rt.block_on(reader.recv_bytes()).unwrap().unwrap());
+                } else {
+                    std::hint::black_box(rt.block_on(reader.recv()).unwrap().unwrap());
+                }
+            }
+            return;
+        }
+
+        for _ in 0..1000 {
+            match case {
+                "encode_call" => {
+                    std::hint::black_box(encode_call("noop", &params, Id::Number(1)).unwrap());
+                }
+                "encode_notification" => {
+                    std::hint::black_box(encode_notification("noop", &params).unwrap());
+                }
+                "decode_result" => {
+                    std::hint::black_box(
+                        decode_result::<Vec<u64>>(&response, &Id::Number(1)).unwrap(),
+                    );
+                }
+                "decode_unit" => {
+                    decode_result::<()>(
+                        br#"{"jsonrpc":"2.0","result":null,"id":1}"#,
+                        &Id::Number(1),
+                    )
+                    .unwrap();
+                }
+                _ => panic!("unknown allocation profile: {case}"),
+            }
+        }
+    }
+
     criterion_group!(
         benches,
         bench_single_dispatch,
@@ -275,12 +547,19 @@ mod bench_impl {
         bench_protocol_roundtrip,
         bench_framing,
         bench_framed_reads,
+        bench_multiplex,
+        bench_receive,
     );
 
     /// Entry point re-exported as the binary `main` when the required features
     /// are enabled. `criterion_main!` would define a private `main`; wrap it so
     /// it can be pulled up to the crate root.
     pub fn main() {
+        #[cfg(feature = "client")]
+        if let Ok(case) = std::env::var("JASONRPC_ALLOC_PROFILE") {
+            allocation_profile(&case);
+            return;
+        }
         benches();
         criterion::Criterion::default()
             .configure_from_args()

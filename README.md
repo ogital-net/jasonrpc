@@ -141,9 +141,28 @@ use jasonrpc::transport::Netstring;
 // One long-lived multiplexed connection to the upstream.
 let upstream = UdsClient::connect("/run/upstream.sock", Netstring).await?;
 
-// Proxy raw bytes: rewrite ids, forward, restore ids on reply — no re-parsing.
-let reply = upstream.round_trip_raw(request_bytes).await?;
+// Pass the rewritten id with the request bytes to avoid re-parsing them.
+let reply = upstream.round_trip_raw_with_id(request_bytes, request_id).await?;
 ```
+
+The supplied id must match the id encoded in the request bytes. Typed
+`Client::call` requests use this path automatically. The byte-only
+`round_trip_raw(request_bytes)` method remains available when the id is not
+already known; multiplexed transports extract it from the bytes. Transports
+that do not need correlation metadata, such as HTTP, use the default
+`Transport::round_trip_with_id` implementation, which delegates to `round_trip`.
+
+Typed calls also use `Transport::round_trip_response`. Its default wraps the
+raw reply in a `ReceivedResponse`; multiplexed transports reuse the envelope
+already parsed for routing. The result is decoded in the caller's task, not
+the shared reader. Raw forwarding retains the original bytes, including
+formatting and recoverable malformed envelopes.
+
+`FramedReader::recv_bytes` and `FramedConn::recv_bytes` return shared `Bytes`
+payloads. All built-in codecs extract these without copying the payload.
+Custom codecs inherit a copying `Framing::decode_bytes` fallback. The existing
+`recv` methods still return `Vec<u8>` and use a direct owned-payload path.
+Keeping a shared payload alive also retains its underlying read allocation.
 
 For a stream you already hold (not a socket path), wrap it yourself with
 `Client::new(MultiplexTransport::new(stream, framing))`; `UdsClient` is the
@@ -204,9 +223,107 @@ cargo bench --bench dispatch --no-default-features \
 A plain `cargo bench` (no features) prints the command to re-run with the
 features the benchmark needs, rather than skipping silently.
 
+Enable `client` to benchmark multiplexed typed calls and byte-only raw calls
+over a persistent in-memory netstring connection. The `multiplex` group uses
+arrays containing 0, 512, or 32768 integers (approximately 0, 1 KiB, or 64 KiB
+of parameters), a current-thread runtime, and a server that extracts the id
+and returns a null result. Timings include request encoding for typed calls,
+framing, scheduling, response routing, and decoding; these are not socket or
+network throughput measurements. Raw calls clone pre-encoded request bytes
+and provide a control for typed-path optimizations.
+
+```sh
+# Before changing the implementation, save a baseline.
+cargo bench --bench dispatch \
+    --features "server,client,tokio,netstring" -- multiplex --save-baseline multiplex-before-serde-json
+
+# After changing the implementation, compare against the saved baseline.
+cargo bench --bench dispatch \
+    --features "server,client,tokio,netstring" -- multiplex --baseline multiplex-before-serde-json
+```
+
+For sonic-rs, add `--no-default-features`, include `backend-sonic` in the
+features, and use a separate baseline name such as `multiplex-before-sonic`.
+
+The `receive` group separately measures standalone `decode_result` and
+multiplexed calls with small requests returning arrays of the same three
+sizes. The server prebuilds the result, updates the response id, and serializes
+the envelope for each reply. Multiplexed timings include that server work,
+framing, scheduling, routing, and typed decoding. Standalone timings isolate
+the decoder. Save receive baselines before changing the implementation:
+
+```sh
+cargo bench --bench dispatch \
+    --features "server,client,tokio,netstring" -- receive --save-baseline receive-before-serde-json
+
+cargo bench --bench dispatch \
+    --features "server,client,tokio,netstring" -- receive --baseline receive-before-serde-json
+```
+
+Use `receive-before-sonic` with the Sonic feature configuration for its
+independent baseline. Shared buffers remove payload copies, but do not
+guarantee lower latency for small replies; compare the complete workload as
+well as standalone decoding.
+
 On x86-64, add `RUSTFLAGS="-C target-cpu=native"` for a fair `sonic-rs`
 comparison — the default `target-cpu` there is a conservative baseline (SSE2)
 that handicaps SIMD parsing. On aarch64, NEON is already enabled by default.
+
+### Allocation profiling
+
+The benchmark also has a fixed-count mode that runs 1,000 operations without
+Criterion setup, warm-up, or reporting. Build with symbols and set `BENCH` to
+the executable path printed by Cargo:
+
+```sh
+CARGO_PROFILE_BENCH_DEBUG=1 cargo bench --bench dispatch --no-run \
+    --features "server,client,tokio,netstring"
+BENCH=target/release/deps/dispatch-HASH
+
+JASONRPC_ALLOC_PROFILE=encode_call valgrind --tool=dhat --num-callers=20 \
+    --dhat-out-file=target/dhat-encode-call.json "$BENCH"
+
+JASONRPC_ALLOC_PROFILE=multiplex JASONRPC_ALLOC_SIZE=0 \
+    valgrind --tool=dhat --num-callers=20 \
+    --dhat-out-file=target/dhat-multiplex-small.json "$BENCH"
+```
+
+Load the JSON files in Valgrind's `dh_view.html` viewer. Capture separate files
+before and after a change, with the same backend, feature set, and payload size.
+For Sonic, rebuild with `--no-default-features` and `backend-sonic` in the
+feature list, and use the new executable path.
+
+`JASONRPC_ALLOC_PROFILE` selects `encode_call`, `encode_notification`,
+`decode_result`, `decode_unit`, `multiplex`, `multiplex_raw`, `dispatch`,
+`notification`, `notification_unknown`, `batch`, `batch_notification`, `framed_read`,
+`framed_read_shared`, or `framed_write`. `JASONRPC_ALLOC_SIZE` sets the number
+of integers in the payload (default 32,768), or entries in a batch (default
+100). Multiplexed profiles include the in-memory peer's allocations; raw
+calls clone a pre-encoded request. Frame-read profiles create a reader for
+each operation; the writer profile reuses one writer. All totals include
+fixture and runtime setup, so use call stacks to distinguish setup from
+per-operation allocations.
+
+Expected allocations include owned request fields and raw params on dispatch,
+boxed handler futures, output buffers and their growth, owned typed results,
+and multiplexing's oneshot channels. Call and notification encoding writes
+params directly into the final buffer, omits null params, and wraps scalars
+without serializing them twice. Numeric-id null-result decoding needs no heap
+allocation. Writers reuse their framing buffer; shared readers use spare
+capacity before growing. Shared payloads can retain backing storage after
+delivery, and raw `Vec<u8>` replies can require a copy when that storage is
+still shared. Unknown-method notifications do not construct a discarded error.
+Batch response capacity is reserved once when the first response
+is produced, using the batch length as an upper bound; mixed batches may keep
+spare capacity, while all-notification batches allocate no response vector.
+
+For a separate leak and invalid-access check:
+
+```sh
+JASONRPC_ALLOC_PROFILE=multiplex JASONRPC_ALLOC_SIZE=0 \
+    valgrind --leak-check=full --show-leak-kinds=definite,indirect \
+    --errors-for-leak-kinds=definite,indirect --error-exitcode=1 "$BENCH"
+```
 
 ## Spec conformance
 
@@ -232,12 +349,12 @@ cargo test --test spec_conformance --features "server,tokio"
 | `backend-serde-json` | `serde_json` | Default JSON backend |
 | `backend-sonic` | `sonic-rs` | Alternative JSON backend |
 | `server` | -- | `Router` and handler infrastructure |
-| `client` | -- | `Client`, `Transport` trait, id correlation |
+| `client` | `bytes` | `Client`, `Transport` trait, id correlation |
 | `transport` | -- | `Framing` trait |
 | `netstring` | -- | Netstring framing (`transport`) |
 | `newline` | -- | Newline / byte-delimited framing (`transport`) |
 | `content-length` | -- | LSP/DAP `Content-Length` header framing (`transport`) |
-| `tokio` | `tokio` | Async I/O helpers (`transport`) |
+| `tokio` | `tokio`, `bytes` | Async I/O helpers (`transport`) |
 | `uds` | `tokio` | `UdsClient`: Unix-socket client (`client`) |
 | `hyper` | `hyper` | `HyperService` adapter (`server`) |
 | `tower` | `tower-service`, `http`, `http-body` | `RpcService` adapter (`server`) |

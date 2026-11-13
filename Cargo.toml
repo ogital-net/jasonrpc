@@ -28,7 +28,7 @@ backend-sonic = ["dep:sonic-rs"]
 
 # --- Library layers ---
 server = []
-client = []
+client = ["dep:bytes"]
 transport = []
 
 # HTTP client transport
@@ -49,7 +49,7 @@ newline = ["transport", "dep:memchr"]
 content-length = ["transport", "dep:memchr", "dep:itoa"]
 
 # Async I/O helpers for the transport layer.
-tokio = ["transport", "dep:tokio"]
+tokio = ["transport", "dep:tokio", "dep:bytes"]
 
 # Batteries-included Unix-domain-socket client (`UdsClient`). Connects a
 # `UnixStream`, wraps it in the multiplexing transport, and hands back a

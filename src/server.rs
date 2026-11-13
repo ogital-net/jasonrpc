@@ -531,6 +531,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
                 }
                 handler.call(state, req, ctx).await
             }
+            None if id.is_none() => return None,
             None => Err(Error::method_not_found()),
         };
 
@@ -594,6 +595,9 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         let mut responses = Vec::new();
         for item in &split.items {
             if let Some(resp) = self.handle_element_bytes_with_context(item, &ctx).await {
+                if responses.is_empty() {
+                    responses.reserve_exact(split.items.len());
+                }
                 responses.push(resp);
             }
         }
@@ -652,6 +656,15 @@ mod tests {
     async fn notification_yields_nothing() {
         let out = router()
             .handle_bytes(br#"{"jsonrpc":"2.0","method":"notify","params":[1]}"#)
+            .await;
+        assert!(matches!(out, Output::Empty));
+        assert!(out.to_bytes().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_method_notification_yields_nothing() {
+        let out = router()
+            .handle_bytes(br#"{"jsonrpc":"2.0","method":"unknown","params":[]}"#)
             .await;
         assert!(matches!(out, Output::Empty));
         assert!(out.to_bytes().unwrap().is_none());

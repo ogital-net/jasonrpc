@@ -26,6 +26,8 @@
 //!   terminator byte.
 
 use crate::error::TransportError;
+#[cfg(feature = "tokio")]
+use bytes::{Buf, Bytes, BytesMut};
 
 /// A message framing: how to delimit JSON messages on a byte stream.
 ///
@@ -89,6 +91,29 @@ pub trait Framing {
         self.decode(src)
     }
 
+    /// Decode a frame from a shared buffer, consuming its framing bytes.
+    ///
+    /// The default uses [`decode_from`](Self::decode_from) and converts its
+    /// owned payload into shared bytes. Codecs can override this to split a
+    /// payload from the input allocation without copying it. `offset` has the
+    /// same meaning as in [`decode_from`](Self::decode_from).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TransportError`] if the framing is malformed.
+    #[cfg(feature = "tokio")]
+    fn decode_bytes(
+        &self,
+        src: &mut BytesMut,
+        offset: usize,
+    ) -> Result<Option<Bytes>, TransportError> {
+        let Some((payload, consumed)) = self.decode_from(src, offset)? else {
+            return Ok(None);
+        };
+        src.advance(consumed);
+        Ok(Some(Bytes::from(payload)))
+    }
+
     /// When `true`, the I/O driver treats EOF as a valid frame boundary:
     /// whatever is buffered becomes the next message. This supports clients
     /// that delimit requests by half-closing the connection (`shutdown SHUT_WR`)
@@ -144,6 +169,13 @@ impl Delimited {
     pub const fn delimiter(&self) -> u8 {
         self.0
     }
+
+    fn decode_range(&self, src: &[u8], offset: usize) -> Option<(std::ops::Range<usize>, usize)> {
+        memchr::memchr(self.0, &src[offset..]).map(|relative| {
+            let end = offset + relative;
+            (0..end, end + 1)
+        })
+    }
 }
 
 #[cfg(feature = "newline")]
@@ -163,12 +195,20 @@ impl Framing for Delimited {
         src: &[u8],
         offset: usize,
     ) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
-        if let Some(relative) = memchr::memchr(self.0, &src[offset..]) {
-            let idx = offset + relative;
-            Ok(Some((src[..idx].to_vec(), idx + 1)))
-        } else {
-            Ok(None)
-        }
+        Ok(self
+            .decode_range(src, offset)
+            .map(|(range, consumed)| (src[range].to_vec(), consumed)))
+    }
+
+    #[cfg(feature = "tokio")]
+    fn decode_bytes(
+        &self,
+        src: &mut BytesMut,
+        offset: usize,
+    ) -> Result<Option<Bytes>, TransportError> {
+        Ok(self
+            .decode_range(src, offset)
+            .map(|(range, consumed)| src.split_to(consumed).freeze().slice(range)))
     }
 
     fn take_on_eof(&self) -> bool {
@@ -205,6 +245,15 @@ impl Framing for Newline {
         Delimited(b'\n').decode_from(src, offset)
     }
 
+    #[cfg(feature = "tokio")]
+    fn decode_bytes(
+        &self,
+        src: &mut BytesMut,
+        offset: usize,
+    ) -> Result<Option<Bytes>, TransportError> {
+        Delimited(b'\n').decode_bytes(src, offset)
+    }
+
     fn take_on_eof(&self) -> bool {
         true
     }
@@ -221,18 +270,11 @@ impl Framing for Newline {
 pub struct Netstring;
 
 #[cfg(feature = "netstring")]
-impl Framing for Netstring {
-    fn encode(&self, payload: &[u8], dst: &mut Vec<u8>) {
-        let mut itoa_buf = itoa::Buffer::new();
-        let header = itoa_buf.format(payload.len());
-        dst.reserve(header.len() + payload.len() + 2);
-        dst.extend_from_slice(header.as_bytes());
-        dst.push(b':');
-        dst.extend_from_slice(payload);
-        dst.push(b',');
-    }
-
-    fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+impl Netstring {
+    fn decode_range(
+        &self,
+        src: &[u8],
+    ) -> Result<Option<(std::ops::Range<usize>, usize)>, TransportError> {
         // Scalar scan: on well-formed input the colon is only a few bytes away.
         let Some(colon) = src.iter().position(|&b| b == b':') else {
             // Guard against an unbounded/garbage length prefix.
@@ -264,7 +306,36 @@ impl Framing for Netstring {
             ));
         }
 
-        Ok(Some((src[colon + 1..end].to_vec(), end + 1)))
+        Ok(Some((colon + 1..end, end + 1)))
+    }
+}
+
+#[cfg(feature = "netstring")]
+impl Framing for Netstring {
+    fn encode(&self, payload: &[u8], dst: &mut Vec<u8>) {
+        let mut itoa_buf = itoa::Buffer::new();
+        let header = itoa_buf.format(payload.len());
+        dst.reserve(header.len() + payload.len() + 2);
+        dst.extend_from_slice(header.as_bytes());
+        dst.push(b':');
+        dst.extend_from_slice(payload);
+        dst.push(b',');
+    }
+
+    fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+        Ok(self
+            .decode_range(src)?
+            .map(|(range, consumed)| (src[range].to_vec(), consumed)))
+    }
+
+    #[cfg(feature = "tokio")]
+    fn decode_bytes(
+        &self,
+        src: &mut BytesMut,
+        _offset: usize,
+    ) -> Result<Option<Bytes>, TransportError> {
+        let decoded = self.decode_range(src)?;
+        Ok(decoded.map(|(range, consumed)| src.split_to(consumed).freeze().slice(range)))
     }
 
     fn take_on_eof(&self) -> bool {
@@ -327,6 +398,33 @@ impl Framing for ContentLength {
     }
 
     fn decode(&self, src: &[u8]) -> Result<Option<(Vec<u8>, usize)>, TransportError> {
+        Ok(self
+            .decode_range(src)?
+            .map(|(range, consumed)| (src[range].to_vec(), consumed)))
+    }
+
+    #[cfg(feature = "tokio")]
+    fn decode_bytes(
+        &self,
+        src: &mut BytesMut,
+        _offset: usize,
+    ) -> Result<Option<Bytes>, TransportError> {
+        Ok(self
+            .decode_range(src)?
+            .map(|(range, consumed)| src.split_to(consumed).freeze().slice(range)))
+    }
+
+    fn take_on_eof(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "content-length")]
+impl ContentLength {
+    fn decode_range(
+        &self,
+        src: &[u8],
+    ) -> Result<Option<(std::ops::Range<usize>, usize)>, TransportError> {
         // Locate the end of the header block: a blank line (`\r\n\r\n`).
         let Some(sep) = find_header_end(src) else {
             if src.len() > Self::MAX_HEADER_BYTES {
@@ -378,11 +476,7 @@ impl Framing for ContentLength {
             return Ok(None); // payload still arriving
         }
 
-        Ok(Some((src[header_end..end].to_vec(), end)))
-    }
-
-    fn take_on_eof(&self) -> bool {
-        false
+        Ok(Some((header_end..end, end)))
     }
 }
 
@@ -457,6 +551,7 @@ fn split_crlf(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// `conns.abort_all()` if it elapses.
 #[cfg(feature = "tokio")]
 pub mod io {
+    use bytes::{Bytes, BytesMut};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -479,14 +574,14 @@ pub mod io {
     /// connection share exactly the same framing, EOF, timeout, and size-limit
     /// behavior rather than duplicating it.
     struct ReadCore {
-        read_buf: Vec<u8>,
+        read_buf: BytesMut,
         decode_offset: usize,
         read_timeout: Option<Duration>,
         max_frame_size: usize,
     }
 
     struct ReadBufferGuard<'a> {
-        buffer: &'a mut Vec<u8>,
+        buffer: &'a mut BytesMut,
         filled_len: usize,
     }
 
@@ -496,10 +591,54 @@ pub mod io {
         }
     }
 
+    trait FramePayload: Sized {
+        fn decode<F: Framing>(
+            framing: &F,
+            buffer: &mut BytesMut,
+            offset: usize,
+        ) -> Result<Option<Self>, TransportError>;
+
+        fn from_eof(buffer: &mut BytesMut) -> Self;
+    }
+
+    impl FramePayload for Bytes {
+        fn decode<F: Framing>(
+            framing: &F,
+            buffer: &mut BytesMut,
+            offset: usize,
+        ) -> Result<Option<Self>, TransportError> {
+            framing.decode_bytes(buffer, offset)
+        }
+
+        fn from_eof(buffer: &mut BytesMut) -> Self {
+            buffer.split().freeze()
+        }
+    }
+
+    impl FramePayload for Vec<u8> {
+        fn decode<F: Framing>(
+            framing: &F,
+            buffer: &mut BytesMut,
+            offset: usize,
+        ) -> Result<Option<Self>, TransportError> {
+            let Some((payload, consumed)) = framing.decode_from(buffer, offset)? else {
+                return Ok(None);
+            };
+            bytes::Buf::advance(buffer, consumed);
+            Ok(Some(payload))
+        }
+
+        fn from_eof(buffer: &mut BytesMut) -> Self {
+            let payload = buffer.to_vec();
+            buffer.clear();
+            payload
+        }
+    }
+
     impl ReadCore {
         fn new() -> Self {
             Self {
-                read_buf: Vec::with_capacity(CHUNK_SIZE),
+                read_buf: BytesMut::with_capacity(CHUNK_SIZE),
                 decode_offset: 0,
                 read_timeout: None,
                 max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -507,14 +646,15 @@ pub mod io {
         }
 
         /// Read a single complete payload, or `None` at clean end-of-stream.
-        async fn recv<R, F>(
+        async fn recv<R, F, P>(
             &mut self,
             inner: &mut R,
             framing: &F,
-        ) -> Result<Option<Vec<u8>>, TransportError>
+        ) -> Result<Option<P>, TransportError>
         where
             R: AsyncRead + Unpin,
             F: Framing,
+            P: FramePayload,
         {
             loop {
                 if self.max_frame_size > 0 && self.read_buf.len() > self.max_frame_size {
@@ -523,10 +663,7 @@ pub mod io {
                         self.max_frame_size
                     )));
                 }
-                if let Some((msg, consumed)) =
-                    framing.decode_from(&self.read_buf, self.decode_offset)?
-                {
-                    self.read_buf.drain(..consumed);
+                if let Some(msg) = P::decode(framing, &mut self.read_buf, self.decode_offset)? {
                     self.decode_offset = 0;
                     return Ok(Some(msg));
                 }
@@ -539,7 +676,7 @@ pub mod io {
                         if self.read_buf.is_empty() {
                             Ok(None)
                         } else {
-                            Ok(Some(std::mem::take(&mut self.read_buf)))
+                            Ok(Some(P::from_eof(&mut self.read_buf)))
                         }
                     } else if self.read_buf.is_empty() {
                         Ok(None)
@@ -569,10 +706,16 @@ pub mod io {
                 )));
             }
 
-            let read_len = if self.max_frame_size > 0 {
-                CHUNK_SIZE.min((self.max_frame_size - start).max(1))
-            } else {
+            let spare = self.read_buf.capacity() - start;
+            let read_len = if spare == 0 {
                 CHUNK_SIZE
+            } else {
+                spare.min(CHUNK_SIZE)
+            };
+            let read_len = if self.max_frame_size > 0 {
+                read_len.min((self.max_frame_size - start).max(1))
+            } else {
+                read_len
             };
 
             // Grow to receive up to CHUNK_SIZE bytes into the tail, read into
@@ -666,6 +809,17 @@ pub mod io {
         /// Returns a [`TransportError`] on I/O errors, framing violations,
         /// read timeout, or if the frame exceeds [`max_frame_size`](Self::with_max_frame_size).
         pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+            self.core.recv(&mut self.inner, &self.framing).await
+        }
+
+        /// Receive a shared payload, without copying it when the codec supports it.
+        ///
+        /// Cancellation, timeout, EOF, and frame-size behavior match [`Self::recv`].
+        ///
+        /// # Errors
+        ///
+        /// Returns the same I/O and framing errors as [`Self::recv`].
+        pub async fn recv_bytes(&mut self) -> Result<Option<Bytes>, TransportError> {
             self.core.recv(&mut self.inner, &self.framing).await
         }
     }
@@ -777,12 +931,109 @@ pub mod io {
         pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
             self.core.recv(&mut self.inner, &self.framing).await
         }
+
+        /// Receive a shared payload, without copying it when the codec supports it.
+        ///
+        /// Cancellation, timeout, EOF, and frame-size behavior match [`Self::recv`].
+        ///
+        /// # Errors
+        ///
+        /// Returns the same I/O and framing errors as [`Self::recv`].
+        pub async fn recv_bytes(&mut self) -> Result<Option<Bytes>, TransportError> {
+            self.core.recv(&mut self.inner, &self.framing).await
+        }
     }
 }
 
 #[cfg(all(test, feature = "netstring"))]
 mod netstring_tests {
     use super::*;
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn shared_frames_retain_input_storage() {
+        let codecs: Vec<Box<dyn Framing>> = vec![
+            Box::new(Netstring),
+            #[cfg(feature = "newline")]
+            Box::new(Newline),
+            #[cfg(feature = "newline")]
+            Box::new(Delimited::new(0)),
+            #[cfg(feature = "content-length")]
+            Box::new(ContentLength),
+        ];
+
+        for codec in codecs {
+            let mut first_frame = Vec::new();
+            codec.encode(b"first", &mut first_frame);
+            let mut second_frame = Vec::new();
+            codec.encode(b"second", &mut second_frame);
+            let offset = first_frame
+                .windows(5)
+                .position(|window| window == b"first")
+                .unwrap();
+
+            let mut partial = BytesMut::from(&first_frame[..first_frame.len() - 1]);
+            let snapshot = partial.clone();
+            assert!(codec.decode_bytes(&mut partial, 0).unwrap().is_none());
+            assert_eq!(partial, snapshot);
+
+            let mut buffer = BytesMut::from(first_frame.as_slice());
+            buffer.extend_from_slice(&second_frame);
+            let expected = buffer.as_ptr().wrapping_add(offset);
+            let first = codec.decode_bytes(&mut buffer, 0).unwrap().unwrap();
+            assert_eq!(first.as_ptr(), expected);
+            assert_eq!(first, b"first".as_slice());
+            assert_eq!(buffer.as_ref(), second_frame);
+            let second = codec.decode_bytes(&mut buffer, 0).unwrap().unwrap();
+            assert_eq!(second, b"second".as_slice());
+            buffer.reserve(8192);
+            buffer.extend_from_slice(&vec![0; 8192]);
+            assert_eq!(first, b"first".as_slice());
+            assert_eq!(second, b"second".as_slice());
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn shared_reader_payload_survives_subsequent_receives() {
+        use crate::transport::io::FramedReader;
+
+        let mut reader = FramedReader::new(b"5:first,6:second,".as_slice(), Netstring);
+        let first = reader.recv_bytes().await.unwrap().unwrap();
+        let second = reader.recv_bytes().await.unwrap().unwrap();
+        assert!(reader.recv_bytes().await.unwrap().is_none());
+        assert_eq!(first, b"first".as_slice());
+        assert_eq!(second, b"second".as_slice());
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn shared_reader_reuses_spare_capacity_with_live_payloads() {
+        use crate::transport::io::FramedReader;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct OneFramePerRead;
+
+        impl AsyncRead for OneFramePerRead {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                buffer.put_slice(b"5:first,");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut reader = FramedReader::new(OneFramePerRead, Netstring);
+        let first = reader.recv_bytes().await.unwrap().unwrap();
+        let second = reader.recv_bytes().await.unwrap().unwrap();
+        assert_eq!(second.as_ptr(), first.as_ptr().wrapping_add(8));
+        assert_eq!(first, b"first".as_slice());
+        assert_eq!(second, b"first".as_slice());
+    }
 
     #[test]
     fn round_trip() {
