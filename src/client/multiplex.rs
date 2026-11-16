@@ -8,8 +8,8 @@
 //! - A background **reader task** owns the read half of the connection. It loops
 //!   decoding frames, parses the `id` out of each response, and routes the raw
 //!   bytes to whoever is waiting for that id.
-//! - A **pending map** (`HashMap<Id, oneshot::Sender<ReceivedResponse>>`) records, for
-//!   each in-flight request, a one-shot channel to deliver its reply. Each call
+//! - A **pending map** records each in-flight request's response sender and
+//!   removes it when the response arrives. Each call
 //!   registers its id *before* writing, so a fast reply can't arrive before the
 //!   waiter is recorded.
 //! - The **write half** is behind a mutex so concurrent calls serialize whole
@@ -44,6 +44,7 @@ pub enum MultiplexError {
     /// requests (with an id); use `send_notification` for id-less messages.
     MissingId,
     /// Another request with the same id is already awaiting a response.
+    /// This detects in-flight collisions, not reuse of an earlier request id.
     DuplicateId,
     /// The underlying connection closed or errored while a call was in flight.
     ConnectionClosed,
@@ -114,12 +115,10 @@ impl Drop for ReaderStateGuard {
 ///
 /// A `round_trip` future can be dropped before its reply arrives — most
 /// commonly when a caller-side timeout (`Client::with_request_timeout`) or
-/// cancellation fires while awaiting the oneshot. Without this guard the
-/// registered sender would linger in the map forever, since the reader only
-/// removes an id when a matching reply actually arrives. On a long-lived
-/// multiplexed connection that is an unbounded leak. Dropping the guard on
-/// every exit path — success, error, or cancellation — keeps the map bounded
-/// by the number of genuinely in-flight calls.
+/// cancellation fires while awaiting the oneshot. Cleanup prevents abandoned
+/// calls from accumulating in the map. Once the reader has delivered a reply,
+/// it has already removed the entry, so successful completion disarms the guard.
+/// Caller-owned ids must not be reused on this connection.
 struct PendingGuard<'a> {
     state: &'a SharedState,
     id: Option<Id>,
@@ -133,8 +132,6 @@ impl<'a> PendingGuard<'a> {
         }
     }
 
-    /// Disarm the guard once the reply has been received, so a normal
-    /// completion doesn't do a redundant (already-removed) map lookup.
     fn disarm(mut self) {
         self.id = None;
     }
@@ -181,6 +178,21 @@ impl Drop for ReaderTaskGuard {
 /// Cancelling an in-progress frame write invalidates the connection and fails
 /// all pending calls with [`MultiplexError::ConnectionClosed`]. Cancelling while
 /// waiting for the writer lock or a response leaves the connection usable.
+///
+/// # Request IDs
+///
+/// Callers MUST supply ids that are unique over the lifetime of the connection,
+/// across all transport clones. Do not reuse an id after a response, timeout,
+/// cancellation, or error. This prevents late responses and cancelled-call
+/// cleanup from interfering with newer calls.
+///
+/// The transport rejects ids that are currently awaiting a response, but keeps
+/// no history and does not enforce lifetime uniqueness. Reusing an id violates
+/// the contract and can cause incorrect correlation or failed calls.
+///
+/// Each [`Client`](super::Client) has an independent id allocator. Share one
+/// client rather than constructing clients around clones of this transport.
+/// When mixing typed and raw calls, raw callers must use a disjoint id space.
 pub struct MultiplexTransport<W, F> {
     writer: Arc<AsyncMutex<FramedWriter<W, F>>>,
     state: SharedState,
@@ -330,8 +342,8 @@ where
         let (tx, rx) = oneshot::channel();
 
         // Register the waiter BEFORE writing, so a fast reply can't race us.
-        // The guard removes our id from the pending map on every exit path,
-        // including if this future is dropped mid-await (timeout/cancellation).
+        // The guard cleans up cancelled calls; the reader removes entries
+        // when routing replies.
         {
             let mut state = self.state.lock().unwrap();
             if !state.connected {
@@ -1034,6 +1046,71 @@ mod tests {
         let _ = first.await;
         tokio::task::yield_now().await;
         assert_eq!(transport.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn answered_call_cleanup_does_not_remove_other_ids() {
+        use crate::transport::io::FramedConn;
+
+        for cancel in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let transport = MultiplexTransport::new(client_io, Netstring);
+            let mut peer = FramedConn::new(server_io, Netstring);
+            let request = br#"{"jsonrpc":"2.0","method":"m","id":1}"#.to_vec();
+            let mut first = Box::pin(transport.round_trip_with_id(request.clone(), Id::Number(1)));
+            assert_pending(first.as_mut()).await;
+            assert_eq!(peer.recv().await.unwrap().unwrap(), request);
+            peer.send(br#"{"jsonrpc":"2.0","result":42,"id":1}"#)
+                .await
+                .unwrap();
+            peer.send(br#"{"jsonrpc":"2.0","result":99,"id":1}"#)
+                .await
+                .unwrap();
+
+            let mut barrier = Box::pin(transport.round_trip_with_id(
+                br#"{"jsonrpc":"2.0","method":"m","id":2}"#.to_vec(),
+                Id::Number(2),
+            ));
+            assert_pending(barrier.as_mut()).await;
+            peer.recv().await.unwrap().unwrap();
+            peer.send(br#"{"jsonrpc":"2.0","result":0,"id":2}"#)
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), barrier)
+                .await
+                .expect("the reader must deliver all preceding responses")
+                .unwrap();
+
+            assert_eq!(transport.pending_len(), 0);
+            let next_request = br#"{"jsonrpc":"2.0","method":"m","id":3}"#.to_vec();
+            let mut next =
+                Box::pin(transport.round_trip_with_id(next_request.clone(), Id::Number(3)));
+            assert_pending(next.as_mut()).await;
+            assert_eq!(peer.recv().await.unwrap().unwrap(), next_request);
+            assert_eq!(transport.pending_len(), 1);
+
+            if cancel {
+                drop(first);
+            } else {
+                let response = first.await.unwrap();
+                assert_eq!(
+                    crate::client::decode_result::<i64>(&response, &Id::Number(1)).unwrap(),
+                    42
+                );
+            }
+            assert_eq!(transport.pending_len(), 1);
+            assert!(transport.is_connected());
+
+            peer.send(br#"{"jsonrpc":"2.0","result":7,"id":3}"#)
+                .await
+                .unwrap();
+            let response = next.await.unwrap();
+            assert_eq!(
+                crate::client::decode_result::<i64>(&response, &Id::Number(3)).unwrap(),
+                7
+            );
+            assert_eq!(transport.pending_len(), 0);
+        }
     }
 
     #[tokio::test]

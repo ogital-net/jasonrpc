@@ -40,6 +40,9 @@ mod uds;
 pub use uds::{ReconnectingUds, RetryPolicy, UdsClient};
 
 /// Monotonic request-id allocator. Cheap to clone via shared reference.
+///
+/// Each instance has an independent sequence. Use one allocator for a shared
+/// connection, and never reuse an id on that connection.
 #[derive(Debug, Default)]
 pub struct IdGen {
     next: AtomicU64,
@@ -327,6 +330,13 @@ impl ReceivedResponse {
 /// ergonomic `Box<dyn std::error::Error + Send + Sync>` works directly as a
 /// transport error type, as does any concrete `std::error::Error`.
 ///
+/// # Request IDs
+///
+/// When a transport multiplexes calls over a shared connection, callers MUST
+/// provide request ids that are unique over that connection's lifetime. This
+/// includes calls made through transport clones and calls that timed out or
+/// were cancelled. Transports need not track or reject previously used ids.
+///
 /// ```
 /// use jasonrpc::client::Transport;
 ///
@@ -413,6 +423,11 @@ pub trait Transport {
 }
 
 /// A high-level client over a [`Transport`], with automatic id allocation.
+///
+/// Each client owns an independent id allocator. For a multiplexed connection,
+/// share one client (for example via [`Arc`](std::sync::Arc)) rather than
+/// constructing multiple clients around clones of the same transport. Raw calls
+/// must use ids disjoint from the client's automatically allocated numeric ids.
 ///
 /// ```
 /// # use jasonrpc::client::Transport;
@@ -518,7 +533,10 @@ impl<T: Transport> Client<T> {
     /// This is the proxy/gateway entry point: forward an already-serialized
     /// JSON-RPC request (whose `id` you control) over the transport -- including
     /// a multiplexed one -- and get the raw response back to relay onward. The
-    /// caller is responsible for id allocation and correlation semantics.
+    /// caller is responsible for id allocation and correlation semantics. On a
+    /// multiplexed connection, ids MUST be unique over the connection's lifetime,
+    /// including across clones, timeouts, and cancellations. When mixing raw and
+    /// typed calls, raw ids must not overlap those allocated by [`call`](Self::call).
     ///
     /// # Errors
     ///

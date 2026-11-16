@@ -205,6 +205,16 @@ already known; multiplexed transports extract it from the bytes. Transports
 that do not need correlation metadata, such as HTTP, use the default
 `Transport::round_trip_with_id` implementation, which delegates to `round_trip`.
 
+For multiplexed connections, request IDs MUST be unique over the entire lifetime
+of the connection, across all transport clones. Uniqueness is the caller's
+responsibility, including after responses, timeouts, cancellations, and errors.
+The transport rejects currently pending duplicates but keeps no history of used
+IDs. Reusing an ID can misroute a late response or interfere with call cleanup.
+Share one `Client` rather than constructing multiple clients around transport
+clones: each client has its own ID counter. When mixing typed and raw calls,
+use disjoint ID spaces, such as automatically allocated numeric IDs for typed
+calls and prefixed string IDs for raw calls.
+
 Typed calls also use `Transport::round_trip_response`. Its default wraps the
 raw reply in a `ReceivedResponse`; multiplexed transports reuse the envelope
 already parsed for routing. The result is decoded in the caller's task, not

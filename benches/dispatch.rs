@@ -300,9 +300,11 @@ mod bench_impl {
         group.warm_up_time(std::time::Duration::from_secs(1));
         group.measurement_time(std::time::Duration::from_secs(3));
 
+        let mut next_raw_id = -1_i64;
         for count in [0, 512, 32 * 1024] {
             let params = vec![7_u64; count];
             let (request, _) = encode_call("noop", &params, Id::Number(1)).unwrap();
+            let raw_request: Request = json::from_slice(&request).unwrap();
             group.throughput(Throughput::Bytes(request.len() as u64));
             group.bench_with_input(
                 BenchmarkId::new("typed_call", count),
@@ -316,14 +318,16 @@ mod bench_impl {
             );
             group.bench_with_input(
                 BenchmarkId::new("raw_call", count),
-                &request,
+                &raw_request,
                 |bench, request| {
+                    let mut request = request.clone();
                     bench.iter(|| {
+                        request.set_id(Id::Number(next_raw_id));
+                        next_raw_id = next_raw_id.checked_sub(1).expect("benchmark IDs exhausted");
+                        let bytes = json::to_vec(&request).unwrap();
                         std::hint::black_box(
-                            rt.block_on(
-                                client.round_trip_raw(std::hint::black_box(request.clone())),
-                            )
-                            .unwrap(),
+                            rt.block_on(client.round_trip_raw(std::hint::black_box(bytes)))
+                                .unwrap(),
                         );
                     });
                 },
@@ -441,9 +445,12 @@ mod bench_impl {
                     }
                 });
                 let client = Client::new(MultiplexTransport::new(client_io, Netstring));
-                for _ in 0..1000 {
+                let mut raw_request: Request = json::from_slice(&request).unwrap();
+                for index in 0..1000_i64 {
                     if case == "multiplex_raw" {
-                        std::hint::black_box(client.round_trip_raw(request.clone()).await.unwrap());
+                        raw_request.set_id(Id::Number(-index - 1));
+                        let bytes = json::to_vec(&raw_request).unwrap();
+                        std::hint::black_box(client.round_trip_raw(bytes).await.unwrap());
                     } else {
                         client.call::<_, ()>("noop", &params).await.unwrap();
                     }
