@@ -57,7 +57,7 @@ fn spec_router() -> Router<()> {
 }
 
 /// Dispatch bytes and return the response as a UTF-8 string (panics if empty).
-async fn call(router: &Router<()>, input: &[u8]) -> String {
+async fn call<S: Clone + Send + Sync + 'static>(router: &Router<S>, input: &[u8]) -> String {
     let out = router.handle_bytes(input).await;
     let bytes = out.to_bytes().unwrap().expect("expected a response body");
     let shared = router
@@ -172,6 +172,71 @@ async fn whitespace_only_is_parse_error() {
     let out = call(&spec_router(), b" \r\n\t").await;
     assert!(out.contains("-32700"), "{out}");
     assert!(out.contains("\"id\":null"), "{out}");
+}
+
+#[tokio::test]
+async fn invalid_utf8_never_executes_handlers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::with_state(Arc::clone(&calls)).register(
+        "tracked",
+        |calls: Arc<AtomicUsize>, _req: Request| async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, Error>(42)
+        },
+    );
+    let valid = br#"{"jsonrpc":"2.0","method":"tracked","id":2}"#.as_slice();
+
+    for request in [
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"tracked\",\"extra\":\"\xff\",\"id\":1}".as_slice(),
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"tracked\",\"params\":{\"extra\":\"\xff\"},\"id\":1}"
+            .as_slice(),
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"tracked\",\"extra\":\"\xff\"}".as_slice(),
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"tracked\",\"params\":[\"\xff\"]}".as_slice(),
+    ] {
+        for max_batch_len in [0, 1, 2] {
+            let router = router.clone().with_max_batch_len(max_batch_len);
+            for input in [
+                request.to_vec(),
+                [b"[".as_slice(), valid, b",", request, b"]"].concat(),
+                [b"[".as_slice(), request, b",", valid, b"]"].concat(),
+            ] {
+                let out = call(&router, &input).await;
+                let response: jasonrpc::Response = json::from_slice(out.as_bytes()).unwrap();
+                assert_eq!(response.id(), &jasonrpc::Id::Null);
+                assert_eq!(response.error_obj(), Some(&Error::parse_error()));
+                assert_eq!(calls.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unicode_params_survive_single_and_batch_dispatch() {
+    let router = Router::new().register("echo", |_, req: Request| async move {
+        req.param_as::<String>()
+            .map_err(|error| Error::invalid_params().with_data(error.to_string()))
+    });
+    let request = "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[\"\u{00e9}\u{1f680}\\u0061\"],\"id\":\"\u{00df}\"}";
+    let out = call(&router, request.as_bytes()).await;
+    let response: jasonrpc::Response = json::from_slice(out.as_bytes()).unwrap();
+    assert_eq!(response.id(), &jasonrpc::Id::String("\u{00df}".into()));
+    assert_eq!(
+        response.result_as::<String>().as_deref(),
+        Some("\u{00e9}\u{1f680}a")
+    );
+
+    let batch = format!("[{request}]");
+    let out = call(&router, batch.as_bytes()).await;
+    let responses: Vec<jasonrpc::Response> = json::from_slice(out.as_bytes()).unwrap();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].id(), response.id());
+    assert_eq!(
+        responses[0].result_as::<String>(),
+        response.result_as::<String>()
+    );
 }
 
 #[tokio::test]

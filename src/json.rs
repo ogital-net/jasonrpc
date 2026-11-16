@@ -12,7 +12,7 @@
 
 #[cfg(feature = "server")]
 pub(crate) struct ArrayItems<'a> {
-    pub(crate) items: Vec<std::borrow::Cow<'a, [u8]>>,
+    pub(crate) items: Vec<std::borrow::Cow<'a, str>>,
     pub(crate) total_len: usize,
 }
 
@@ -60,11 +60,11 @@ mod imp {
         Value::String(s.to_owned())
     }
 
-    /// Split a JSON array into the raw bytes of each element, preserving each
-    /// element's exact serialization. Each element borrows from `bytes`.
+    /// Split a JSON array into the raw text of each element, preserving each
+    /// element's exact serialization. Each element borrows from `text`.
     #[cfg(feature = "server")]
     pub fn split_array(
-        bytes: &[u8],
+        text: &str,
         max_items: Option<usize>,
     ) -> Result<super::ArrayItems<'_>, JsonError> {
         use serde::de::{SeqAccess, Visitor};
@@ -90,14 +90,14 @@ mod imp {
                 while let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? {
                     total_len = total_len.saturating_add(1);
                     if self.max_items.is_none_or(|max| items.len() < max) {
-                        items.push(std::borrow::Cow::Borrowed(raw.get().as_bytes()));
+                        items.push(std::borrow::Cow::Borrowed(raw.get()));
                     }
                 }
                 Ok(super::ArrayItems { items, total_len })
             }
         }
 
-        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let mut deserializer = serde_json::Deserializer::from_str(text);
         let items = deserializer.deserialize_seq(ArrayVisitor { max_items })?;
         deserializer.end()?;
         Ok(items)
@@ -148,18 +148,17 @@ mod imp {
         Value::from(s)
     }
 
-    /// Split a JSON array into the raw bytes of each element, preserving each
-    /// element's exact serialization. Each element borrows from `bytes` when
+    /// Split a JSON array into the raw text of each element, preserving each
+    /// element's exact serialization. Each element borrows from `text` when
     /// the element's raw text is unescaped (the common case), otherwise it is
     /// owned.
     #[cfg(feature = "server")]
     pub fn split_array(
-        bytes: &[u8],
+        text: &str,
         max_items: Option<usize>,
     ) -> Result<super::ArrayItems<'_>, JsonError> {
         use serde::de::{SeqAccess, Visitor};
         use serde::Deserializer;
-        use std::borrow::Cow;
 
         struct ArrayVisitor {
             max_items: Option<usize>,
@@ -181,17 +180,13 @@ mod imp {
                 while let Some(raw) = seq.next_element::<sonic_rs::LazyValue<'de>>()? {
                     total_len = total_len.saturating_add(1);
                     if self.max_items.is_none_or(|max| items.len() < max) {
-                        items.push(match raw.as_raw_cow() {
-                            Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
-                            Cow::Owned(text) => Cow::Owned(text.into_bytes()),
-                        });
+                        items.push(raw.as_raw_cow());
                     }
                 }
                 Ok(super::ArrayItems { items, total_len })
             }
         }
 
-        let text = std::str::from_utf8(bytes).map_err(<JsonError as serde::de::Error>::custom)?;
         let mut deserializer = sonic_rs::Deserializer::from_str(text);
         let items = deserializer.deserialize_seq(ArrayVisitor { max_items })?;
         deserializer.end()?;
@@ -383,17 +378,17 @@ pub(crate) fn string(s: &str) -> Value {
     imp::string(s)
 }
 
-/// Split a JSON array into the raw bytes of each element.
+/// Split a JSON array into the raw text of each element.
 ///
 /// Each returned element is the exact serialization of one array entry,
-/// borrowing from `bytes` where the backend allows, so a batch entry can be
-/// re-parsed from its own bytes without a copy in the common case.
+/// borrowing from `text` where the backend allows, so a batch entry can be
+/// re-parsed without a copy or another UTF-8 check in the common case.
 #[cfg(feature = "server")]
 pub(crate) fn split_array(
-    bytes: &[u8],
+    text: &str,
     max_items: Option<usize>,
 ) -> Result<ArrayItems<'_>, JsonError> {
-    imp::split_array(bytes, max_items)
+    imp::split_array(text, max_items)
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -442,21 +437,16 @@ mod tests {
 
     #[test]
     fn split_array_retains_only_configured_items() {
-        let split = split_array(b"[1,2,3]", Some(2)).unwrap();
+        let split = split_array("[1,2,3]", Some(2)).unwrap();
         assert_eq!(split.total_len, 3);
         assert_eq!(split.items.len(), 2);
-        assert_eq!(split.items[0], b"1".as_slice());
-        assert_eq!(split.items[1], b"2".as_slice());
+        assert_eq!(split.items[0], "1");
+        assert_eq!(split.items[1], "2");
     }
 
     #[test]
     fn split_array_validates_elements_after_limit() {
-        for input in [
-            b"[1,2,invalid]".as_slice(),
-            b"[1,\"\xff\"]".as_slice(),
-            br#"[1,"\q"]"#.as_slice(),
-            b"[1,\"raw\nnewline\"]".as_slice(),
-        ] {
+        for input in ["[1,2,invalid]", r#"[1,"\q"]"#, "[1,\"raw\nnewline\"]"] {
             for limit in [None, Some(1), Some(0)] {
                 assert!(
                     split_array(input, limit).is_err(),
@@ -469,13 +459,12 @@ mod tests {
     #[test]
     fn split_array_rejects_trailing_input() {
         for input in [
-            b"[1] garbage".as_slice(),
-            b"[1][]".as_slice(),
-            b"[1] {}".as_slice(),
-            b"[1] true".as_slice(),
-            b"[1]\0".as_slice(),
-            b"[1]\xff".as_slice(),
-            b"[] garbage".as_slice(),
+            "[1] garbage",
+            "[1][]",
+            "[1] {}",
+            "[1] true",
+            "[1]\0",
+            "[] garbage",
         ] {
             for limit in [None, Some(1), Some(0)] {
                 assert!(
@@ -488,9 +477,9 @@ mod tests {
 
     #[test]
     fn split_array_accepts_trailing_whitespace() {
-        for input in [b"[1,2,3] \r\n\t".as_slice(), b"[] \r\n\t".as_slice()] {
+        for input in ["[1,2,3] \r\n\t", "[] \r\n\t"] {
             let split = split_array(input, None).unwrap();
-            let values: Vec<Value> = from_slice(input).unwrap();
+            let values: Vec<Value> = from_str_borrowed(input).unwrap();
             assert_eq!(split.total_len, values.len());
             assert_eq!(split.items.len(), values.len());
         }
@@ -498,13 +487,13 @@ mod tests {
 
     #[test]
     fn split_array_preserves_raw_elements_and_borrowing() {
-        let input = br#"[{"text":"a\\b","items":[1, 2]},"escaped\nstring","\u0061",3]"#;
+        let input = r#"[{"text":"a\\b","items":[1, 2]},"escaped\nstring","\u0061",3]"#;
         let split = split_array(input, None).unwrap();
-        let expected: [&[u8]; 4] = [
-            br#"{"text":"a\\b","items":[1, 2]}"#,
-            br#""escaped\nstring""#,
-            br#""\u0061""#,
-            b"3",
+        let expected = [
+            r#"{"text":"a\\b","items":[1, 2]}"#,
+            r#""escaped\nstring""#,
+            r#""\u0061""#,
+            "3",
         ];
         assert_eq!(split.total_len, expected.len());
         assert_eq!(split.items.len(), expected.len());

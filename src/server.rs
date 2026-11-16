@@ -477,13 +477,10 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
             .await
     }
 
-    fn parse_input(
-        bytes: &[u8],
-        shared: Option<&bytes::Bytes>,
-    ) -> Result<Request, json::JsonError> {
+    fn parse_input(text: &str, shared: Option<&bytes::Bytes>) -> Result<Request, json::JsonError> {
         match shared {
-            Some(body) => Request::from_shared_bytes(body.slice_ref(bytes)),
-            None => json::from_slice(bytes),
+            Some(body) => Request::from_shared_str(text, body),
+            None => json::from_str_borrowed(text),
         }
     }
 
@@ -493,6 +490,10 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         shared: Option<&bytes::Bytes>,
         ctx: RequestContext,
     ) -> Output {
+        let text = match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return Output::Single(Response::error(Id::Null, Error::parse_error())),
+        };
         // Peek at the first non-whitespace byte to distinguish a batch (array,
         // `[`) from a single request (object, `{`) without a full parse.
         let first = match bytes.iter().find(|b| !b.is_ascii_whitespace()) {
@@ -500,19 +501,16 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
             None => return Output::Single(Response::error(Id::Null, Error::parse_error())),
         };
         match first {
-            b'[' => {
-                self.handle_batch_bytes_with_context(bytes, shared, ctx)
-                    .await
-            }
+            b'[' => self.handle_batch_str_with_context(text, shared, ctx).await,
             b'{' => {
-                if let Ok(req) = Self::parse_input(bytes, shared) {
+                if let Ok(req) = Self::parse_input(text, shared) {
                     if let Some(resp) = self.handle_request_with_context(req, ctx).await {
                         Output::Single(resp)
                     } else {
                         Output::Empty
                     }
                 } else {
-                    let is_json = json::from_slice::<Value>(bytes).is_ok();
+                    let is_json = json::from_str_borrowed::<Value>(text).is_ok();
                     Output::Single(Response::error(
                         Id::Null,
                         if is_json {
@@ -524,7 +522,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
                 }
             }
             _ => {
-                let is_json = json::from_slice::<Value>(bytes).is_ok();
+                let is_json = json::from_str_borrowed::<Value>(text).is_ok();
                 Output::Single(Response::error(
                     Id::Null,
                     if is_json {
@@ -584,14 +582,14 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         })
     }
 
-    /// Process one batch element, given its raw JSON bytes, with context.
-    async fn handle_element_bytes_with_context(
+    /// Process one batch element, given its raw JSON text, with context.
+    async fn handle_element_str_with_context(
         &self,
-        bytes: &[u8],
+        text: &str,
         shared: Option<&bytes::Bytes>,
         ctx: &RequestContext,
     ) -> Option<Response> {
-        match Self::parse_input(bytes, shared) {
+        match Self::parse_input(text, shared) {
             Ok(req) => {
                 // Each batch element gets its own clone of the context.
                 self.handle_request_with_context(req, ctx.clone()).await
@@ -601,17 +599,17 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     }
 
     /// Process a batch with context.
-    async fn handle_batch_bytes_with_context(
+    async fn handle_batch_str_with_context(
         &self,
-        bytes: &[u8],
+        text: &str,
         shared: Option<&bytes::Bytes>,
         ctx: RequestContext,
     ) -> Output {
-        // Elements borrow from `bytes` — no per-element copy in the common case.
-        let split = if let Ok(items) = json::split_array(bytes, self.max_batch_len) {
+        // Elements borrow from `text` — no per-element copy in the common case.
+        let split = if let Ok(items) = json::split_array(text, self.max_batch_len) {
             items
         } else {
-            let is_json = json::from_slice::<Value>(bytes).is_ok();
+            let is_json = json::from_str_borrowed::<Value>(text).is_ok();
             return Output::Single(Response::error(
                 Id::Null,
                 if is_json {
@@ -647,7 +645,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
                 std::borrow::Cow::Owned(_) => None,
             };
             if let Some(resp) = self
-                .handle_element_bytes_with_context(item, item_shared, &ctx)
+                .handle_element_str_with_context(item, item_shared, &ctx)
                 .await
             {
                 if responses.is_empty() {

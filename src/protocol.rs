@@ -534,7 +534,7 @@ impl<'de> Deserialize<'de> for Request {
 
 impl Request {
     #[cfg(feature = "server")]
-    pub(crate) fn from_shared_bytes(bytes: bytes::Bytes) -> Result<Self, JsonError> {
+    pub(crate) fn from_shared_str(text: &str, bytes: &bytes::Bytes) -> Result<Self, JsonError> {
         #[derive(Deserialize)]
         struct Fields<'a> {
             jsonrpc: Version,
@@ -545,7 +545,6 @@ impl Request {
             id: Option<Id>,
         }
 
-        let text = std::str::from_utf8(&bytes).map_err(<JsonError as de::Error>::custom)?;
         if !text.trim_start().starts_with('{') {
             return Err(<JsonError as de::Error>::custom(
                 "expected a JSON-RPC request object",
@@ -1280,7 +1279,7 @@ mod tests {
         let body = bytes::Bytes::from_static(
             br#"{"jsonrpc":"2.0","method":"ingest","params":{ "n": 123456789012345678901234567890, "s": "\u0061", "f": 1.2300 },"id":null}"#,
         );
-        let request = Request::from_shared_bytes(body).unwrap();
+        let request = Request::from_shared_str(std::str::from_utf8(&body).unwrap(), &body).unwrap();
         let bytes = crate::json::to_vec(&request).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(
@@ -1294,12 +1293,12 @@ mod tests {
             br#"{"jsonrpc":"2.0","method":"ingest","method":"other"}"#,
             br#"{"jsonrpc":"2.0","method":"ingest","params":{},"params":{}}"#,
             br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"\q"}}"#,
-            b"{\"jsonrpc\":\"2.0\",\"method\":\"ingest\",\"extra\":\"\xff\"}",
             b"{\"jsonrpc\":\"2.0\",\"method\":\"ingest\",\"params\":{\"data\":\"raw\nnewline\"}}",
             br#"{"jsonrpc":"2.0","method":"ingest"} true"#,
         ] {
+            let body = bytes::Bytes::copy_from_slice(input);
             assert!(
-                Request::from_shared_bytes(bytes::Bytes::copy_from_slice(input)).is_err(),
+                Request::from_shared_str(std::str::from_utf8(&body).unwrap(), &body).is_err(),
                 "accepted {input:?}"
             );
         }
@@ -1316,7 +1315,7 @@ mod tests {
             br#"{"jsonrpc":"2.0","method":"ingest","params":{"data":"YWJj"},"id":1}"#,
         );
         let offset = body.windows(4).position(|bytes| bytes == b"YWJj").unwrap();
-        let request = Request::from_shared_bytes(body.clone()).unwrap();
+        let request = Request::from_shared_str(std::str::from_utf8(&body).unwrap(), &body).unwrap();
         let params: Params<'_> = request.params_as_borrowed().unwrap();
         assert_eq!(params.data.as_ptr(), body[offset..].as_ptr());
         let clone = request.clone();
