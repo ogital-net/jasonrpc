@@ -56,7 +56,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-jasonrpc = { version = "0.7", features = ["server"] }
+jasonrpc = { version = "0.8", features = ["server"] }
 ```
 
 ### Server
@@ -239,10 +239,10 @@ Exactly one backend must be selected:
 
 ```toml
 # Default
-jasonrpc = "0.7"
+jasonrpc = "0.8"
 
 # Or sonic-rs:
-jasonrpc = { version = "0.7", default-features = false, features = ["backend-sonic"] }
+jasonrpc = { version = "0.8", default-features = false, features = ["backend-sonic"] }
 ```
 
 Use `json::Value` and `json::JsonError` to refer to the selected backend's native

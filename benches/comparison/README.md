@@ -7,7 +7,7 @@ package requires Rust 1.87 or newer because of jsonrpsee.
 
 | Implementation | Version | Timed public API |
 | --- | --- | --- |
-| jasonrpc | Local checkout (0.7.0) | `Router::handle_bytes` followed by `to_bytes` |
+| jasonrpc | Local checkout (0.8.0) | `Router::handle_bytes` followed by `to_bytes` |
 | jsonrpsee-core | 0.26.1 | `RpcModule::raw_json_request` |
 | jsonrpc-core | 18.0.0 | `IoHandler::handle_request` |
 
