@@ -315,11 +315,11 @@ where
 /// Like [`serve`], but stops cleanly when `shutdown` resolves.
 ///
 /// This is the graceful-shutdown entry point. It drives the [`Router`] exactly
-/// like [`serve`], but races each read against the `shutdown` future. When
-/// `shutdown` resolves first, the loop stops accepting new messages, sends a
-/// WebSocket Close frame (normal-closure `1000`) to the peer, and returns
-/// `Ok(())`. A response already being written is allowed to finish first, so no
-/// reply is truncated mid-flight.
+/// like [`serve`], but races each read against the `shutdown` future. A ready
+/// shutdown takes priority over reading the next message. The loop then stops
+/// accepting new messages, sends a WebSocket Close frame (normal-closure `1000`)
+/// to the peer, and returns `Ok(())`. An in-progress dispatch and its response
+/// are allowed to finish first, so no reply is truncated mid-flight.
 ///
 /// `shutdown` is any `Future`, so it composes with whatever signal the
 /// application already uses — a [`tokio::sync::oneshot`] receiver, a
@@ -428,9 +428,6 @@ where
     loop {
         let frame = tokio::select! {
             biased;
-            // Prefer draining a ready frame over an equally-ready shutdown,
-            // so an already-arrived request is still answered.
-            frame = socket.read_frame() => frame,
             () = shutdown.as_mut() => {
                 // Send a normal-closure Close frame and stop. Ignore the
                 // write result: the peer may already be gone.
@@ -438,7 +435,8 @@ where
                     .write_frame(Frame::close(1000, b"server shutting down"))
                     .await;
                 return Ok(());
-            }
+            },
+            frame = socket.read_frame() => frame,
         };
 
         // `read_frame` handles obligated sends (auto-pong / auto-close) itself.
@@ -770,38 +768,110 @@ mod tests {
         assert!(server.await.unwrap().is_ok());
     }
 
-    /// A request already on the wire when shutdown fires is still answered
-    /// (biased select drains readable frames before honoring shutdown).
     #[tokio::test]
-    async fn shutdown_still_answers_pending_request() {
+    async fn shutdown_is_not_starved_by_buffered_notifications() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new().register("notify", {
+            let dispatched = Arc::clone(&dispatched);
+            let shutdown = Arc::clone(&shutdown);
+            move |_, _req: Request| {
+                let dispatched = Arc::clone(&dispatched);
+                let shutdown = Arc::clone(&shutdown);
+                async move {
+                    dispatched.fetch_add(1, Ordering::SeqCst);
+                    shutdown.notify_one();
+                    tokio::task::yield_now().await;
+                    Ok(())
+                }
+            }
+        });
+        let mut client = WebSocket::after_handshake(client_io, Role::Client);
+        client.set_auto_close(false);
+        for _ in 0..32 {
+            client
+                .write_frame(Frame::text(Payload::Borrowed(
+                    br#"{"jsonrpc":"2.0","method":"notify"}"#,
+                )))
+                .await
+                .unwrap();
+        }
+
+        let socket = WebSocket::after_handshake(server_io, Role::Server);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            serve_with_shutdown(socket, &router, shutdown.notified()),
+        )
+        .await
+        .expect("ready shutdown must stop accepting queued messages")
+        .unwrap();
+
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        let close = client.read_frame().await.unwrap();
+        assert_eq!(close.opcode, OpCode::Close);
+        assert_eq!(&close.payload[..2], &1000_u16.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn shutdown_still_answers_in_progress_request() {
+        use std::sync::Arc;
+
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
 
-        let server = tokio::spawn(async move {
-            let ws = WebSocket::after_handshake(server_io, Role::Server);
-            let shutdown = async move {
-                let _ = rx.await;
-            };
-            serve_with_shutdown(ws, &router(), shutdown).await
-        });
+        let server = {
+            let started = Arc::clone(&started);
+            let finish = Arc::clone(&finish);
+            tokio::spawn(async move {
+                let router = router().register("wait", move |_, _req: Request| {
+                    let started = Arc::clone(&started);
+                    let finish = Arc::clone(&finish);
+                    async move {
+                        started.notify_one();
+                        finish.notified().await;
+                        Ok(42)
+                    }
+                });
+                let ws = WebSocket::after_handshake(server_io, Role::Server);
+                let shutdown = async move {
+                    let _ = rx.await;
+                };
+                serve_with_shutdown(ws, &router, shutdown).await
+            })
+        };
 
         let mut client = WebSocket::after_handshake(client_io, Role::Client);
         client.set_auto_close(false);
-        let call = br#"{"jsonrpc":"2.0","method":"add","params":[40,2],"id":1}"#;
+        let call = br#"{"jsonrpc":"2.0","method":"wait","id":1}"#;
         client
             .write_frame(Frame::text(Payload::Borrowed(call)))
             .await
             .unwrap();
 
-        let reply = client.read_frame().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("the request handler must start before shutdown");
+        tx.send(()).unwrap();
+        finish.notify_one();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.read_frame())
+            .await
+            .expect("the active request must complete despite shutdown")
+            .unwrap();
         assert_eq!(reply.opcode, OpCode::Text);
         let s = String::from_utf8(reply.payload.to_vec()).unwrap();
         assert!(s.contains("\"result\":42"), "{s}");
+        assert!(s.contains("\"id\":1"), "{s}");
 
-        // Now shut down; expect a Close frame next.
-        tx.send(()).unwrap();
         let frame = client.read_frame().await.unwrap();
         assert_eq!(frame.opcode, OpCode::Close);
+        assert_eq!(&frame.payload[..2], &1000_u16.to_be_bytes());
         assert!(server.await.unwrap().is_ok());
     }
 }
