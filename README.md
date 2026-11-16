@@ -161,10 +161,11 @@ full decoded allocation. See the [attachment ownership measurements](benches/com
 ### Client
 
 ```rust,ignore
+use std::time::Duration;
 use jasonrpc::client::{Client, HttpTransport};
 
 let transport = HttpTransport::new("http://127.0.0.1:8080/")?;
-let client = Client::new(transport);
+let client = Client::new(transport).with_request_timeout(Duration::from_secs(10));
 
 let sum: i64 = client.call("add", (1, 2)).await?;
 assert_eq!(sum, 3);
@@ -431,7 +432,7 @@ cargo test --test spec_conformance --features "server,tokio"
 | `hyper` | `hyper` | `HyperService` adapter (`server`) |
 | `tower` | `tower-service`, `http`, `http-body` | `RpcService` adapter (`server`) |
 | `websocket` | `fastwebsockets` | WebSocket `serve` adapter, reuses hyper (`server`) |
-| `http-client` | `hyper`, `hyper-util` | `HttpTransport` (`client`) |
+| `http-client` | `hyper`, `hyper-util`, `tokio` | `HttpTransport` (`client`, `tokio`) |
 
 HTTP request bodies and WebSocket messages default to a 16 MiB limit. WebSocket
 limits include all fragments of a logical message. Configure smaller limits at

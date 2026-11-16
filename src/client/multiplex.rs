@@ -193,6 +193,11 @@ impl Drop for ReaderTaskGuard {
 /// Each [`Client`](super::Client) has an independent id allocator. Share one
 /// client rather than constructing clients around clones of this transport.
 /// When mixing typed and raw calls, raw callers must use a disjoint id space.
+///
+/// Error responses with a null id, which servers send when they cannot parse a
+/// request, cannot be attributed to a call and are dropped. The affected call
+/// waits until the connection closes, so set
+/// [`with_request_timeout`](super::Client::with_request_timeout).
 pub struct MultiplexTransport<W, F> {
     writer: Arc<AsyncMutex<FramedWriter<W, F>>>,
     state: SharedState,

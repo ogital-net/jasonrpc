@@ -140,7 +140,9 @@ fn encode_request<P: serde::Serialize>(
 ///   an explicit `error: null`
 ///   ([`ClientError::Protocol`])
 /// - The response id does not match `expected` ([`ClientError::IdMismatch`])
-/// - The response contains a JSON-RPC error object ([`ClientError::Rpc`])
+/// - The response contains a JSON-RPC error object ([`ClientError::Rpc`]),
+///   including an error with a null id, which servers send when they cannot
+///   determine the request id
 /// - The response has neither/both of `result` and `error`
 ///   ([`ClientError::MalformedResponse`])
 pub fn decode_result<T: serde::de::DeserializeOwned>(
@@ -149,9 +151,8 @@ pub fn decode_result<T: serde::de::DeserializeOwned>(
 ) -> Result<T, ClientError> {
     validate_response_utf8(bytes).map_err(ClientError::Protocol)?;
     if let Ok(response) = json::from_slice::<TypedResponse<T>>(bytes) {
-        if &response.id != expected {
-            return Err(ClientError::IdMismatch);
-        }
+        let error_only = response.result.is_none() && response.error.is_some();
+        verify_id(&response.id, expected, error_only)?;
         return match (response.result, response.error) {
             (Some(result), None) => Ok(result),
             (None, Some(error)) => Err(ClientError::Rpc(error)),
@@ -160,13 +161,24 @@ pub fn decode_result<T: serde::de::DeserializeOwned>(
     }
 
     let resp: Response = json::from_slice(bytes).map_err(ClientError::Protocol)?;
-    if resp.id() != expected {
-        return Err(ClientError::IdMismatch);
-    }
+    verify_id(
+        resp.id(),
+        expected,
+        resp.result_raw().is_none() && resp.is_error(),
+    )?;
     match (resp.result_raw(), resp.error_obj()) {
         (Some(raw), None) => json::from_raw_value(raw).map_err(ClientError::Protocol),
         (None, Some(e)) => Err(ClientError::Rpc(e.clone())),
         _ => Err(ClientError::MalformedResponse),
+    }
+}
+
+fn verify_id(id: &Id, expected: &Id, error_only: bool) -> Result<(), ClientError> {
+    // A null id marks an error the server could not attribute to a request.
+    if id == expected || (error_only && matches!(id, Id::Null)) {
+        Ok(())
+    } else {
+        Err(ClientError::IdMismatch)
     }
 }
 
@@ -256,9 +268,8 @@ impl ReceivedResponse {
     pub fn decode<T: serde::de::DeserializeOwned>(self, expected: &Id) -> Result<T, ClientError> {
         #[cfg(feature = "tokio")]
         if let Some(envelope) = self.envelope {
-            if &envelope.id != expected {
-                return Err(ClientError::IdMismatch);
-            }
+            let error_only = envelope.result.is_none() && envelope.error.is_some();
+            verify_id(&envelope.id, expected, error_only)?;
             return match (envelope.result, envelope.error) {
                 (Some(result), None) => {
                     let bytes = match &result {
@@ -479,9 +490,10 @@ impl<T: Transport> Client<T> {
     /// Set a request timeout. Calls that don't complete within `timeout` will
     /// return [`ClientError::Timeout`].
     ///
-    /// Requires the `tokio` feature (`tokio::time::timeout` backs it). Without
-    /// tokio there is no runtime timer to drive the deadline, so the method is
-    /// not available — wrap calls in your own runtime's timeout instead.
+    /// Requires the `tokio` feature (`tokio::time::timeout` backs it), which the
+    /// `http-client` and `uds` features enable. Without tokio there is no
+    /// runtime timer to drive the deadline, so the method is not available —
+    /// wrap calls in your own runtime's timeout instead.
     #[cfg(feature = "tokio")]
     #[must_use]
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
@@ -816,6 +828,44 @@ mod tests {
         let bytes = br#"{"jsonrpc":"2.0","result":19,"id":8}"#;
         let e = decode_result::<i64>(bytes, &Id::Number(7)).unwrap_err();
         assert!(matches!(e, ClientError::IdMismatch));
+    }
+
+    #[test]
+    fn decode_reports_null_id_errors_as_rpc_errors() {
+        let error = br#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request","data":"detail"},"id":null}"#;
+        let direct = decode_result::<i64>(error, &Id::Number(7));
+        #[cfg(feature = "tokio")]
+        let cached = {
+            let response = ReceivedResponse::parsed(error.to_vec());
+            assert!(response.envelope.is_some());
+            response.decode::<i64>(&Id::Number(7))
+        };
+        #[cfg(not(feature = "tokio"))]
+        let cached = ReceivedResponse::from_bytes(error.to_vec()).decode::<i64>(&Id::Number(7));
+        for result in [direct, cached] {
+            let Err(ClientError::Rpc(error)) = result else {
+                panic!("expected the server's error, got {result:?}");
+            };
+            assert_eq!(error.code(), -32600);
+            assert_eq!(error.data_as::<String>().as_deref(), Some("detail"));
+        }
+
+        for bytes in [
+            br#"{"jsonrpc":"2.0","result":19,"id":null}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","result":19,"error":{"code":0,"message":""},"id":null}"#
+                .as_slice(),
+            br#"{"jsonrpc":"2.0","id":null}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                decode_result::<i64>(bytes, &Id::Number(7)),
+                Err(ClientError::IdMismatch)
+            ));
+            #[cfg(feature = "tokio")]
+            assert!(matches!(
+                ReceivedResponse::parsed(bytes.to_vec()).decode::<i64>(&Id::Number(7)),
+                Err(ClientError::IdMismatch)
+            ));
+        }
     }
 
     #[test]

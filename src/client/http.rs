@@ -123,13 +123,28 @@ pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 /// token), attach an [`Authorizer`] with
 /// [`with_authorizer`](Self::with_authorizer); the type parameter `A` defaults
 /// to [`NoAuth`] so the common no-auth case needs no annotation.
-#[derive(Clone, Debug)]
+///
+/// The transport sets no request timeout; use
+/// [`Client::with_request_timeout`](super::Client::with_request_timeout).
+#[derive(Clone)]
 pub struct HttpTransport<A = NoAuth> {
     client: HyperClient<HttpConnector, Full<Bytes>>,
     uri: Uri,
     headers: HeaderMap,
     max_response_size: usize,
     authorizer: A,
+}
+
+impl<A: std::fmt::Debug> std::fmt::Debug for HttpTransport<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Header values may carry credentials.
+        f.debug_struct("HttpTransport")
+            .field("uri", &self.uri)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("max_response_size", &self.max_response_size)
+            .field("authorizer", &self.authorizer)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Errors produced by [`HttpTransport`].
@@ -144,7 +159,8 @@ pub enum HttpTransportError {
     Body(Box<dyn StdError + Send + Sync>),
     /// The server answered with a non-success HTTP status.
     Status(http::StatusCode),
-    /// A default header name or value was invalid.
+    /// A default header name or value was invalid. Holds the header name; an
+    /// invalid value is omitted because it may be a credential.
     InvalidHeader(String),
     /// The response body exceeded the configured maximum size.
     TooLarge(usize),
@@ -238,7 +254,7 @@ impl<A> HttpTransport<A> {
         let name = HeaderName::try_from(name.as_ref())
             .map_err(|_| HttpTransportError::InvalidHeader(name.as_ref().to_owned()))?;
         let value = HeaderValue::try_from(value.as_ref())
-            .map_err(|_| HttpTransportError::InvalidHeader(value.as_ref().to_owned()))?;
+            .map_err(|_| HttpTransportError::InvalidHeader(format!("{name}: invalid value")))?;
         self.headers.insert(name, value);
         Ok(self)
     }
@@ -551,5 +567,47 @@ mod tests {
             err,
             HttpTransportError::Status(StatusCode::UNAUTHORIZED)
         ));
+    }
+
+    #[test]
+    fn debug_and_errors_omit_header_values() {
+        let transport = HttpTransport::new("http://127.0.0.1:8080/")
+            .unwrap()
+            .with_header("x-api-key", "first-secret")
+            .unwrap();
+        let debug = format!("{transport:?}");
+        assert!(debug.contains("x-api-key"), "{debug}");
+        assert!(!debug.contains("secret"), "{debug}");
+
+        let err = HttpTransport::new("http://127.0.0.1:8080/")
+            .unwrap()
+            .with_header("x-api-key", "second-secret\n")
+            .unwrap_err();
+        assert!(matches!(err, HttpTransportError::InvalidHeader(_)));
+        let message = err.to_string();
+        assert!(message.contains("x-api-key"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn request_timeout_bounds_unresponsive_servers() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.push(stream);
+            }
+        });
+
+        let timeout = std::time::Duration::from_millis(100);
+        let client = crate::client::Client::new(HttpTransport::new(&endpoint).unwrap())
+            .with_request_timeout(timeout);
+        let err = client.call::<_, i64>("m", ()).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::ClientError::Timeout(t) if t == timeout),
+            "{err:?}"
+        );
+        server.abort();
     }
 }
