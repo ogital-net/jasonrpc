@@ -75,7 +75,8 @@ serde = { version = "1", features = ["derive"] }
 
 # JSON backends (optional, one selected via feature).
 serde_json = { version = "1", optional = true, features = ["raw_value"] }
-sonic-rs = { version = "0.5", optional = true }
+# 0.5.11+ skips nested values on the heap; 0.5.10 can overflow the stack on deep input.
+sonic-rs = { version = "0.5.11", optional = true }
 
 # Transport async I/O (optional). `sync`/`rt` back the multiplexing client
 # transport (oneshot correlation channels + a background reader task).

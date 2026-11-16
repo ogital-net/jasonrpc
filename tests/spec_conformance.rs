@@ -17,7 +17,7 @@
 
 use jasonrpc::json::{self, Value};
 use jasonrpc::server::{Output, Router};
-use jasonrpc::{Error, Request};
+use jasonrpc::{codes, Error, Request};
 
 /// Build a router mirroring the methods used in the spec's Section 7 examples.
 fn spec_router() -> Router<()> {
@@ -258,6 +258,49 @@ async fn invalid_batch_bad_json() {
     .await;
     assert!(out.starts_with('{'), "must be a single object: {out}");
     assert!(out.contains("-32700"), "{out}");
+}
+
+#[tokio::test]
+async fn rejection_code_reflects_whole_body_validity() {
+    let nested = format!(r#"{{"x":{}{}}}"#, "[".repeat(200), "]".repeat(200));
+    for (input, code) in [
+        (r#"{"a":[1,2,3]}"#, codes::INVALID_REQUEST),
+        (nested.as_str(), codes::INVALID_REQUEST),
+        ("7", codes::INVALID_REQUEST),
+        (r#""text""#, codes::INVALID_REQUEST),
+        ("null", codes::INVALID_REQUEST),
+        // Semantic errors precede the syntax errors in these bodies.
+        (
+            r#"{"jsonrpc":"1.0","method":"m","params":[1,}"#,
+            codes::PARSE_ERROR,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":1,"params":[1,2"#,
+            codes::PARSE_ERROR,
+        ),
+        (r#"{"method":1,"x":tru}"#, codes::PARSE_ERROR),
+        (
+            r#"{"jsonrpc":"2.0","method":"m","id":1,}"#,
+            codes::PARSE_ERROR,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"m","id":01}"#,
+            codes::PARSE_ERROR,
+        ),
+        ("tru", codes::PARSE_ERROR),
+        (r#""unterminated"#, codes::PARSE_ERROR),
+        ("[1,2", codes::PARSE_ERROR),
+        ("[1] x", codes::PARSE_ERROR),
+    ] {
+        let out = call(&spec_router(), input.as_bytes()).await;
+        let response: jasonrpc::Response = json::from_slice(out.as_bytes()).unwrap();
+        assert_eq!(response.id(), &jasonrpc::Id::Null, "{input}");
+        assert_eq!(
+            response.error_obj().map(Error::code),
+            Some(code),
+            "{input}: {out}"
+        );
+    }
 }
 
 #[tokio::test]

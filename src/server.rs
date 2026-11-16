@@ -24,7 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::json::{self, JsonRawValue, Value};
+use crate::json::{self, JsonRawValue};
 use crate::protocol::{Error, Id, Request, Response};
 
 /// Default maximum number of entries accepted in one batch request.
@@ -133,7 +133,7 @@ pub type NotificationFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// `Fn(S, Request) -> impl Future<Output = Result<T, Error>>` where `T:
 /// Serialize` is a handler. Call results are serialized on return, so a handler
 /// may return an `i64`, a `String`, a `#[derive(Serialize)]` struct, or a
-/// [`Value`] directly. Notification results are dropped without serialization.
+/// [`Value`](crate::json::Value) directly. Notification results are dropped without serialization.
 pub trait Handler<S>: Send + Sync {
     /// Invoke the handler, resolving to the JSON result value or an error.
     fn call(&self, state: S, req: Request) -> HandlerFuture;
@@ -484,6 +484,18 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         }
     }
 
+    /// Reject undispatchable input: Parse error unless the whole body is valid JSON.
+    fn rejection(text: &str, error: Option<&json::JsonError>) -> Output {
+        // Non-syntax errors stop parsing early, so the rest may still be invalid JSON.
+        let syntax = error.is_some_and(|error| error.is_syntax() || error.is_eof());
+        let error = if syntax || json::from_str_borrowed::<serde::de::IgnoredAny>(text).is_err() {
+            Error::parse_error()
+        } else {
+            Error::invalid_request()
+        };
+        Output::Single(Response::error(Id::Null, error))
+    }
+
     async fn handle_input_with_context(
         &self,
         bytes: &[u8],
@@ -502,36 +514,14 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         };
         match first {
             b'[' => self.handle_batch_str_with_context(text, shared, ctx).await,
-            b'{' => {
-                if let Ok(req) = Self::parse_input(text, shared) {
-                    if let Some(resp) = self.handle_request_with_context(req, ctx).await {
-                        Output::Single(resp)
-                    } else {
-                        Output::Empty
-                    }
-                } else {
-                    let is_json = json::from_str_borrowed::<Value>(text).is_ok();
-                    Output::Single(Response::error(
-                        Id::Null,
-                        if is_json {
-                            Error::invalid_request()
-                        } else {
-                            Error::parse_error()
-                        },
-                    ))
-                }
-            }
-            _ => {
-                let is_json = json::from_str_borrowed::<Value>(text).is_ok();
-                Output::Single(Response::error(
-                    Id::Null,
-                    if is_json {
-                        Error::invalid_request()
-                    } else {
-                        Error::parse_error()
-                    },
-                ))
-            }
+            b'{' => match Self::parse_input(text, shared) {
+                Ok(req) => match self.handle_request_with_context(req, ctx).await {
+                    Some(resp) => Output::Single(resp),
+                    None => Output::Empty,
+                },
+                Err(error) => Self::rejection(text, Some(&error)),
+            },
+            _ => Self::rejection(text, None),
         }
     }
 
@@ -606,18 +596,9 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         ctx: RequestContext,
     ) -> Output {
         // Elements borrow from `text` — no per-element copy in the common case.
-        let split = if let Ok(items) = json::split_array(text, self.max_batch_len) {
-            items
-        } else {
-            let is_json = json::from_str_borrowed::<Value>(text).is_ok();
-            return Output::Single(Response::error(
-                Id::Null,
-                if is_json {
-                    Error::invalid_request()
-                } else {
-                    Error::parse_error()
-                },
-            ));
+        let split = match json::split_array(text, self.max_batch_len) {
+            Ok(items) => items,
+            Err(error) => return Self::rejection(text, Some(&error)),
         };
 
         if split.total_len == 0 {
