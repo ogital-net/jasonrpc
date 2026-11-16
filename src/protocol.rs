@@ -282,6 +282,9 @@ fn de_shared_params<'de, D: Deserializer<'de>>(
 
 /// The JSON-RPC 2.0 error object (a protocol value, distinct from a Rust error).
 ///
+/// Deserialization requires an object with an integer `code` and a string
+/// `message`. Unknown fields are ignored, and `data` is kept as raw JSON.
+///
 /// ```
 /// use jasonrpc::Error;
 ///
@@ -293,12 +296,45 @@ fn de_shared_params<'de, D: Deserializer<'de>>(
 /// let err = err.with_data("extra details");
 /// assert!(err.data_raw().is_some());
 /// ```
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Error {
     code: i64,
     message: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<JsonRawValue>,
+}
+
+impl<'de> Deserialize<'de> for Error {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct ErrorFields {
+            code: i64,
+            message: String,
+            #[serde(default)]
+            data: Option<JsonRawValue>,
+        }
+
+        struct ErrorVisitor;
+
+        impl<'de> Visitor<'de> for ErrorVisitor {
+            type Value = Error;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON-RPC error object")
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Error, M::Error> {
+                let fields = ErrorFields::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(Error {
+                    code: fields.code,
+                    message: fields.message,
+                    data: fields.data,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ErrorVisitor)
+    }
 }
 
 impl PartialEq for Error {
@@ -1030,6 +1066,57 @@ mod tests {
         assert_eq!(err.message(), "boom");
         assert!(err.data_raw().is_some());
         assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn error_deserialization_requires_an_object() {
+        for input in [
+            br#"[-32000,"boom"]"#.as_slice(),
+            br#"[-32000,"boom",{"detail":42}]"#.as_slice(),
+            b"[]".as_slice(),
+            b"null".as_slice(),
+            b"true".as_slice(),
+            b"7".as_slice(),
+            br#""boom""#.as_slice(),
+        ] {
+            assert!(
+                crate::json::from_slice::<Error>(input).is_err(),
+                "accepted non-object error: {}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn error_deserialization_preserves_extensions_and_data() {
+        for code in [-32601, 42] {
+            for data in [
+                "null",
+                "true",
+                "42",
+                r#""detail""#,
+                r#"[1,{"nested":false}]"#,
+                r#"{"nested":[1,"two"]}"#,
+            ] {
+                let input = format!(
+                    r#"{{"message":"custom message","extension":{{"ignored":[1,true]}},"data":{data},"code":{code}}}"#
+                );
+                let error: Error = crate::json::from_slice(input.as_bytes()).unwrap();
+                assert_eq!(error.code(), code);
+                assert_eq!(error.message(), "custom message");
+                if data == "null" {
+                    assert!(error.data_raw().is_none());
+                } else {
+                    let actual: crate::json::Value =
+                        crate::json::from_raw_value(error.data_raw().unwrap()).unwrap();
+                    let expected: crate::json::Value =
+                        crate::json::from_slice(data.as_bytes()).unwrap();
+                    assert_eq!(actual, expected);
+                }
+                let encoded = crate::json::to_vec(&error).unwrap();
+                assert_eq!(crate::json::from_slice::<Error>(&encoded).unwrap(), error);
+            }
+        }
     }
 
     #[test]

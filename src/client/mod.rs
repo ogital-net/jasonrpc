@@ -761,15 +761,30 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_explicit_null_error() {
+    fn decode_rejects_non_object_errors() {
         for bytes in [
             br#"{"jsonrpc":"2.0","result":42,"error":null,"id":1}"#.as_slice(),
             br#"{"jsonrpc":"2.0","error":null,"result":42,"id":1}"#.as_slice(),
             br#"{"jsonrpc":"2.0","result":null,"error":null,"id":1}"#.as_slice(),
             br#"{"jsonrpc":"2.0","error":null,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":[-32000,"boom"],"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":[-32000,"boom",{"detail":42}],"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":[],"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":true,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":7,"id":1}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","error":"boom","id":1}"#.as_slice(),
         ] {
             let error = decode_result::<Option<i64>>(bytes, &Id::Number(1)).unwrap_err();
             assert!(matches!(error, ClientError::Protocol(_)), "got {error:?}");
+
+            #[cfg(feature = "tokio")]
+            {
+                let response = ReceivedResponse::parsed(bytes.to_vec());
+                assert!(response.envelope.is_none());
+                assert_eq!(response.as_bytes(), bytes);
+                let error = response.decode::<Option<i64>>(&Id::Number(1)).unwrap_err();
+                assert!(matches!(error, ClientError::Protocol(_)), "got {error:?}");
+            }
         }
     }
 
