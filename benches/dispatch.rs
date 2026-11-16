@@ -6,7 +6,7 @@
 //! identity. Save one baseline per backend, then compare against it:
 //!
 //! ```sh
-//! # Default backend (serde_json) — save its numbers under the `serde_json` name
+//! # Default backend (serde_json): save its numbers under the `serde_json` name
 //! cargo bench --bench dispatch \
 //!     --features "server,tokio,netstring,newline" -- --save-baseline serde_json
 //!

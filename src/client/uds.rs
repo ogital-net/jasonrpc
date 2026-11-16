@@ -7,7 +7,7 @@
 //! # Automatic reconnection
 //!
 //! A Unix socket connection is long-lived, and the peer can go away underneath
-//! it — most commonly when the server process restarts. Rather than leaving the
+//! it, most commonly when the server process restarts. Rather than leaving the
 //! client permanently broken (every subsequent call failing), the UDS client
 //! transparently re-dials the socket when it notices the connection has died.
 //!
@@ -89,7 +89,7 @@ impl RetryPolicy {
 /// closed, re-dials the socket according to a [`RetryPolicy`]. Cheap to clone:
 /// clones share the same live connection and reconnection state.
 ///
-/// You rarely construct this directly — [`UdsClient::connect`] builds a
+/// You rarely construct this directly; [`UdsClient::connect`] builds a
 /// [`Client`] around it for you.
 #[derive(Clone)]
 pub struct ReconnectingUds<F> {
@@ -337,7 +337,7 @@ mod tests {
     ///
     /// Connection tasks are tracked in a `JoinSet` owned by the accept-loop
     /// task, so aborting the returned handle drops the set and cancels every
-    /// live connection too — genuinely dropping the client's socket, the way a
+    /// live connection too, genuinely dropping the client's socket, the way a
     /// real server restart would.
     fn serve_at(path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
         let _ = std::fs::remove_file(&path);

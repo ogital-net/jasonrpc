@@ -510,9 +510,9 @@ fn split_crlf(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// This crate is sans-I/O: for raw transports (UDS, TCP) *you* own the accept
 /// loop, so graceful shutdown is a standard tokio pattern rather than a library
 /// feature. Race `accept` against a shutdown signal, then wait for the spawned
-/// per-connection tasks to drain. Any `Future` works as the signal — a
+/// per-connection tasks to drain. Any `Future` works as the signal (a
 /// [`tokio::sync::oneshot`] receiver, a `broadcast`/`watch` receiver, or
-/// `tokio_util`'s `CancellationToken` — so no extra dependency is required.
+/// `tokio_util`'s `CancellationToken`), so no extra dependency is required.
 ///
 /// ```no_run
 /// # #[cfg(all(feature = "server", unix))]
@@ -524,7 +524,7 @@ fn split_crlf(headers: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// # async fn serve_conn(_r: Router<()>, _s: tokio::net::UnixStream) {}
 ///
 /// # async fn run(listener: UnixListener, router: Router<()>, stop: tokio::sync::oneshot::Receiver<()>) {
-/// // Any future works as the shutdown signal — a oneshot here, but a
+/// // Any future works as the shutdown signal: a oneshot here, but a
 /// // broadcast/watch receiver or `tokio::signal::ctrl_c()` works the same way.
 /// let shutdown = async { let _ = stop.await; };
 /// tokio::pin!(shutdown);
@@ -775,11 +775,14 @@ pub mod io {
             }
         }
 
-        /// Set a per-read timeout. When set, each `read()` call on the
-        /// underlying stream will be cancelled if it takes longer than
-        /// `timeout`. This prevents slowloris-style trickle attacks where a
-        /// client sends one byte at a time to keep a connection alive
-        /// indefinitely.
+        /// Set a per-read timeout. Each read on the underlying stream fails
+        /// with [`TransportError::Frame`] if no bytes arrive within `timeout`,
+        /// which detects idle peers.
+        ///
+        /// This bounds the gap between reads, not the time to receive a frame:
+        /// a peer that sends a byte before each deadline can hold a frame open
+        /// indefinitely. To bound a whole frame, wrap [`recv`](Self::recv) in
+        /// [`tokio::time::timeout`].
         #[must_use]
         pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
             self.core.read_timeout = Some(timeout);
@@ -790,7 +793,7 @@ pub mod io {
         /// be rejected with a [`TransportError::Frame`] error.
         ///
         /// Set to 0 to disable the limit (every read will buffer until EOF or
-        /// a complete frame — dangerous for network-facing services).
+        /// a complete frame; dangerous for network-facing services).
         #[must_use]
         pub fn with_max_frame_size(mut self, limit: usize) -> Self {
             self.core.max_frame_size = limit;
@@ -1302,7 +1305,7 @@ mod newline_framed_io_tests {
 
     #[tokio::test]
     async fn reader_delivers_on_eof_without_newline() {
-        // Simulates a C client: write() + shutdown(SHUT_WR) — no trailing \n.
+        // Simulates a C client: write() + shutdown(SHUT_WR), no trailing \n.
         let data = Cursor::new(b"{\"jsonrpc\":\"2.0\"}");
         let mut reader = FramedReader::new(data, Newline);
         let msg = reader.recv().await.unwrap();

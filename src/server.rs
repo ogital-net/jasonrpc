@@ -48,7 +48,7 @@ pub const DEFAULT_MAX_BATCH_LEN: usize = 1024;
 /// // ctx.extensions.get::<AuthClaims>();
 /// ```
 ///
-/// *Not* `Send + Sync` — it is consumed by one handler, not shared.
+/// Each handler receives its own clone; contexts are not shared between handlers.
 #[derive(Debug, Clone, Default)]
 pub struct RequestContext {
     /// Request headers (available with `hyper` or `tower` feature).
@@ -81,10 +81,10 @@ impl Output {
     ///
     /// The two-layer return type distinguishes three outcomes:
     ///
-    /// - `Ok(Some(bytes))` — a response to send.
-    /// - `Ok(None)` — nothing to send ([`Output::Empty`]: a notification or an
+    /// - `Ok(Some(bytes))`: a response to send.
+    /// - `Ok(None)`: nothing to send ([`Output::Empty`]: a notification or an
     ///   all-notification batch). Send no bytes; for HTTP reply `204 No Content`.
-    /// - `Err(_)` — serialization failed (see below).
+    /// - `Err(_)`: serialization failed (see below).
     ///
     /// ```
     /// # fn main() -> Result<(), jasonrpc::protocol::Error> {
@@ -266,7 +266,7 @@ impl<S: Clone> Clone for Router<S> {
     }
 }
 
-/// A registered method — either context-free or context-aware.
+/// A registered method, either context-free or context-aware.
 enum Method<S> {
     Handler(Arc<dyn Handler<S>>),
     WithContext(Arc<dyn HandlerWithContext<S>>),
@@ -345,7 +345,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     /// Cap the number of entries accepted in a single batch request.
     ///
     /// Because batch elements are dispatched sequentially, an unbounded batch
-    /// lets one request force arbitrarily many handler invocations — a cheap
+    /// lets one request force arbitrarily many handler invocations, a cheap
     /// denial-of-service vector for a network-facing server. When set, a batch
     /// with more than `max` entries is rejected up front with a single Invalid
     /// Request (`-32600`) response and no handlers run.
@@ -379,7 +379,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
     /// A handler is any async closure `Fn(S, Request) -> impl
     /// Future<Output = Result<T, Error>>` where `T: Serialize`. The state
     /// argument's type usually can't be inferred from the closure alone, so
-    /// annotate it — `|state: MyState, req: Request| ...` — when the compiler
+    /// annotate it (`|state: MyState, req: Request| ...`) when the compiler
     /// asks. The [`Request`] parameter's type annotation is likewise required.
     ///
     /// # Panics
@@ -595,7 +595,7 @@ impl<S: Clone + Send + Sync + 'static> Router<S> {
         shared: Option<&bytes::Bytes>,
         ctx: RequestContext,
     ) -> Output {
-        // Elements borrow from `text` — no per-element copy in the common case.
+        // Elements borrow from `text`; no per-element copy in the common case.
         let split = match json::split_array(text, self.max_batch_len) {
             Ok(items) => items,
             Err(error) => return Self::rejection(text, Some(&error)),

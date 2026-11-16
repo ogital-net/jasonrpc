@@ -105,8 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // A shutdown signal for the accept loop. This example fires it manually at
     // the end; a real server would wire it to `tokio::signal::ctrl_c()` or a
-    // SIGTERM handler. Any `Future` works here — oneshot, broadcast/watch, or
-    // `tokio_util`'s `CancellationToken` — so no extra dependency is needed.
+    // SIGTERM handler. Any `Future` works here (oneshot, broadcast/watch, or
+    // `tokio_util`'s `CancellationToken`), so no extra dependency is needed.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Accept loop in the background. Each connection gets a cheap clone of the

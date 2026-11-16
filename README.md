@@ -34,7 +34,7 @@ deserialized when you ask for a concrete type. Many JSON-RPC libraries fully
 parse every message into a value DOM and re-serialize it on the way out;
 `jasonrpc` avoids that round trip, so bytes you don't inspect are never
 re-encoded. This keeps single servers fast and makes byte-forwarding workloads
-(proxies, gateways, fan-out) cheap — but the crate is a general-purpose
+(proxies, gateways, fan-out) cheap, but the crate is a general-purpose
 JSON-RPC toolkit, not a gateway framework.
 
 ## Layers
@@ -47,7 +47,7 @@ The crate is organized so each layer is usable independently:
 | `json` | always-on | Pluggable JSON backend (`serde_json` or `sonic-rs`) |
 | `server` | `server` | `Router` for method registration and dispatch (single + batch) |
 | `client` | `client` | `Client` with typed call/notify, id correlation, and raw passthrough |
-| `transport` | `transport` | Framing codecs (`netstring`, `newline`) and async I/O |
+| `transport` | `transport` | Framing codecs (`netstring`, `newline`, `content-length`) and async I/O |
 | `integration` | `hyper`, `tower`, `websocket` | Adapters: `HyperService`, `RpcService` (axum-ready), WebSocket `serve` |
 
 ## Quick start
@@ -156,7 +156,7 @@ The default HTTP request limit remains 16 MiB; set `with_max_request_body_size`
 on the adapter to a bounded limit covering the encoded body and metadata.
 Base64 expands binary data by approximately one third. Bound concurrent large
 requests and decode attachments into storage incrementally to avoid an additional
-full decoded allocation. See the [attachment ownership measurements](benches/comparison/README.md#large-attachment-ownership).
+full decoded allocation. See the [attachment ownership measurements](https://github.com/ogital-net/jasonrpc/blob/main/benches/comparison/README.md#large-attachment-ownership).
 
 ### Client
 
@@ -270,12 +270,12 @@ cargo run --example ws_controller --features "server,websocket,tokio,hyper"
 request parse/build, framing, and chunked reads of large frames. Enable `newline`
 to compare newline and netstring read performance. The JSON backends are mutually
 exclusive, so the same bench is run once per backend and compared through
-criterion baselines — the baseline name carries
+criterion baselines; the baseline name carries
 the backend identity, and the benchmark ids match, so the second run prints a
 per-benchmark delta:
 
 ```sh
-# serde_json backend — save its numbers under the `serde_json` baseline
+# serde_json backend: save its numbers under the `serde_json` baseline
 cargo bench --bench dispatch \
     --features "server,tokio,netstring,newline" -- --save-baseline serde_json
 
@@ -330,12 +330,12 @@ guarantee lower latency for small replies; compare the complete workload as
 well as standalone decoding.
 
 On x86-64, add `RUSTFLAGS="-C target-cpu=native"` for a fair `sonic-rs`
-comparison — the default `target-cpu` there is a conservative baseline (SSE2)
+comparison; the default `target-cpu` there is a conservative baseline (SSE2)
 that handicaps SIMD parsing. On aarch64, NEON is already enabled by default.
 
 ### Cross-crate comparison
 
-The isolated [comparison benchmark](benches/comparison/README.md) measures
+The isolated [comparison benchmark](https://github.com/ogital-net/jasonrpc/blob/main/benches/comparison/README.md) measures
 matched raw JSON single-call workloads against `jsonrpsee-core` and
 `jsonrpc-core`, with output-equivalence checks and separate serde-json/Sonic
 runs. Its dependencies do not affect the library's normal build or MSRV.
@@ -421,12 +421,12 @@ cargo test --test spec_conformance --features "server,tokio"
 |---------|------|-------------|
 | `backend-serde-json` | `serde_json` | Default JSON backend |
 | `backend-sonic` | `sonic-rs` | Alternative JSON backend |
-| `server` | -- | `Router` and handler infrastructure |
+| `server` | `bytes` | `Router` and handler infrastructure |
 | `client` | `bytes` | `Client`, `Transport` trait, id correlation |
 | `transport` | -- | `Framing` trait |
-| `netstring` | -- | Netstring framing (`transport`) |
-| `newline` | -- | Newline / byte-delimited framing (`transport`) |
-| `content-length` | -- | LSP/DAP `Content-Length` header framing (`transport`) |
+| `netstring` | `itoa` | Netstring framing (`transport`) |
+| `newline` | `memchr` | Newline / byte-delimited framing (`transport`) |
+| `content-length` | `memchr`, `itoa` | LSP/DAP `Content-Length` header framing (`transport`) |
 | `tokio` | `tokio`, `bytes` | Async I/O helpers (`transport`) |
 | `uds` | `tokio` | `UdsClient`: Unix-socket client (`client`) |
 | `hyper` | `hyper` | `HyperService` adapter (`server`) |

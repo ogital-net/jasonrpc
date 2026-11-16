@@ -32,7 +32,7 @@ jobs:
             exit 1
           fi
 
-      # Mirror CI — a green tag push means "these all passed on the commit that
+      # Mirror CI: a green tag push means "these all passed on the commit that
       # was tagged", but rerunning here guards against a dirty local publish.
       - name: Test (serde_json backend, full feature set)
         run: >

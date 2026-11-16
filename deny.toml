@@ -6,7 +6,7 @@
 # Evaluate the deny rules for every combination of features, not just the
 # default build. This catches transitive deps that only appear under optional
 # features (hyper, tower, http-client, etc.).
-all-features = false   # can't use `true` — backends are mutually exclusive.
+all-features = false   # can't use `true`; backends are mutually exclusive.
 # Instead we rely on the CI matrix (each backend + integration feature set).
 
 # ---------------------------------------------------------------------------
@@ -30,7 +30,7 @@ allow = [
 # ---------------------------------------------------------------------------
 [bans]
 # Deny exact duplicates (same crate, different versions) where possible.
-multiple-versions = "warn"   # warn rather than deny — hyper/tower ecosystem
+multiple-versions = "warn"   # warn rather than deny; hyper/tower ecosystem
                               # commonly has temporary version splits.
 wildcards = "deny"            # no `*` version reqs in our own Cargo.toml.
 highlight = "simplest-path"

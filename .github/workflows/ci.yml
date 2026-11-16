@@ -174,9 +174,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # docs.rs uses `all-features = true` (Cargo.toml), which for this crate
-      # resolves to the serde_json backend + all integrations. The sonic backend
-      # is excluded from docs.rs because the backends are mutually exclusive.
+      # Matches [package.metadata.docs.rs] in Cargo.toml: the serde_json backend
+      # plus all integrations. The sonic backend is excluded because the
+      # backends are mutually exclusive.
       - run: >
           cargo doc --no-deps
           --features "server,client,transport,netstring,newline,content-length,tokio,uds,hyper,tower,websocket,http-client"

@@ -1,7 +1,7 @@
 //! HTTP -> UDS gateway: one representative use case.
 //!
 //! This example ties the layers together into a proxy that rewrites and
-//! forwards raw request bytes over a shared multiplexed connection — a
+//! forwards raw request bytes over a shared multiplexed connection, a
 //! demanding workload that motivated the transport-free client split. It is
 //! one of many ways to use the crate, not the only one.
 //!

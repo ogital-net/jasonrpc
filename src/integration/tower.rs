@@ -35,7 +35,7 @@ pub type ResponseBody = Full<Bytes>;
 /// A cloneable tower [`Service`] that dispatches JSON-RPC over HTTP.
 ///
 /// Wraps a [`Router`]; cloning is cheap (the router's method table is shared
-/// behind an `Arc`). Dispatch is by JSON-RPC `method` — the HTTP path and verb
+/// behind an `Arc`). Dispatch is by JSON-RPC `method`; the HTTP path and verb
 /// are ignored, so mount it at a single route.
 ///
 /// ```

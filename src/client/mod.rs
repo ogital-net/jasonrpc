@@ -8,7 +8,7 @@
 //! - [`Client`] -- a driver over a [`Transport`] that performs a round trip.
 //!
 //! This split keeps the correlation logic usable even when you drive the I/O
-//! yourself — for example multiplexing over a shared connection, or proxying
+//! yourself, for example multiplexing over a shared connection, or proxying
 //! raw request bytes without re-parsing them at every hop.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,11 +39,11 @@ mod uds;
 #[cfg(all(feature = "uds", unix))]
 pub use uds::{ReconnectingUds, RetryPolicy, UdsClient};
 
-/// Monotonic request-id allocator. Cheap to clone via shared reference.
+/// Monotonic request-id allocator.
 ///
 /// Each instance has an independent sequence. Use one allocator for a shared
 /// connection, and never reuse an id on that connection.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct IdGen {
     next: AtomicU64,
 }
@@ -60,6 +60,12 @@ impl IdGen {
     /// Allocate the next numeric id.
     pub fn next_id(&self) -> Id {
         Id::Unsigned(self.next.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for IdGen {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -453,7 +459,7 @@ pub trait Transport {
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let client = Client::new(EchoTransport);
 ///
-/// // Send and receive raw bytes — useful for proxies and gateways.
+/// // Send and receive raw bytes (useful for proxies and gateways).
 /// let reply = client.round_trip_raw(b"hello".to_vec()).await?;
 /// assert_eq!(reply, b"hello");
 /// # Ok(())
@@ -492,7 +498,7 @@ impl<T: Transport> Client<T> {
     ///
     /// Requires the `tokio` feature (`tokio::time::timeout` backs it), which the
     /// `http-client` and `uds` features enable. Without tokio there is no
-    /// runtime timer to drive the deadline, so the method is not available —
+    /// runtime timer to drive the deadline, so the method is not available;
     /// wrap calls in your own runtime's timeout instead.
     #[cfg(feature = "tokio")]
     #[must_use]
@@ -1114,7 +1120,7 @@ mod tests {
                 Ok(req)
             }
         }
-        // No timeout set — should still work.
+        // No timeout set; should still work.
         let client = Client::new(Echo);
         let raw = br#"{"jsonrpc":"2.0","method":"m","id":7}"#.to_vec();
         let reply = client.round_trip_raw(raw).await.unwrap();

@@ -369,10 +369,10 @@ impl Error {
     /// construction time.
     ///
     /// If serialization fails the error is returned with no data attached (the
-    /// `data` field is left `None`). For types built with `#[derive(Serialize)]`
-    /// this never fails; use [`try_with_data`](Self::try_with_data) if you need
-    /// to observe a serialization failure (e.g. a type containing `f64::NAN` or
-    /// a non-string map key).
+    /// `data` field is left `None`). Use [`try_with_data`](Self::try_with_data)
+    /// to observe the failure, for example from map keys that cannot be JSON
+    /// strings or a `Serialize` impl that returns an error. Non-finite floats do
+    /// not fail; they serialize as `null`.
     ///
     /// ```
     /// use jasonrpc::Error;
@@ -610,9 +610,8 @@ impl Request {
     /// no-params call.
     ///
     /// If serialization of `params` fails the request is constructed with no
-    /// params. For `#[derive(Serialize)]` types this never happens; use
-    /// [`try_call`](Self::try_call) if `params` can genuinely fail to serialize
-    /// and you want the error rather than a silently param-less request.
+    /// params. Use [`try_call`](Self::try_call) to receive the error instead,
+    /// for example when `params` contains map keys that cannot be JSON strings.
     pub fn call<P: Serialize>(method: impl Into<String>, params: &P, id: Id) -> Self {
         Self {
             jsonrpc: Version,
@@ -828,7 +827,7 @@ impl Request {
     /// # fn main() -> Result<(), jasonrpc::json::JsonError> {
     /// use jasonrpc::{Request, Id};
     ///
-    /// // `{"params": [7]}` — the usual positional form.
+    /// // `{"params": [7]}`: the usual positional form.
     /// let req: Request =
     ///     jasonrpc::json::from_slice(br#"{"jsonrpc":"2.0","method":"get","params":[7],"id":1}"#)?;
     /// assert_eq!(req.param_as::<i64>()?, 7);
@@ -1129,7 +1128,7 @@ mod tests {
         assert!(err.is_valid());
         assert!(err.is_error());
 
-        // Constructors guarantee the invariant — a response with both set can
+        // Constructors guarantee the invariant; a response with both set can
         // only come from deserialization, which we trust the spec for.
     }
 
@@ -1300,7 +1299,7 @@ mod tests {
 
     #[test]
     fn param_as_single_positional() {
-        // `[value]` — the spec-conformant positional form.
+        // `[value]`: the spec-conformant positional form.
         let req: Request =
             crate::json::from_slice(br#"{"jsonrpc":"2.0","method":"m","params":[7],"id":1}"#)
                 .unwrap();

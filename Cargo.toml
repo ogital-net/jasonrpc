@@ -100,7 +100,7 @@ tower-service = { version = "0.3", optional = true }
 # WebSocket integration (optional). `upgrade` reuses hyper for the HTTP upgrade
 # handshake; `simd` enables SIMD frame masking/unmasking.
 fastwebsockets = { version = "0.10", optional = true, features = ["upgrade", "simd"] }
-# HTTP types used by RequestContext — pulled in by hyper or tower features.
+# HTTP types used by RequestContext, pulled in by hyper or tower features.
 # Lightweight (just bytes + itoa, both already transitive), but kept optional
 # so protocol+json users don't pay for it.
 http = { version = "1", optional = true }

@@ -83,7 +83,7 @@ where
     }
 }
 
-/// Build a JSON `200 OK` response with a JSON content type.
+/// Build a response with the given status and a JSON content type.
 ///
 /// # Panics
 ///
@@ -110,7 +110,7 @@ fn empty_response(status: StatusCode) -> HttpResponse<ResponseBody> {
 /// router's method table is shared behind an `Arc`, so a clone only bumps that
 /// reference count and clones the state handle.
 ///
-/// A full accept loop against hyper 1.x looks like this — clone the service
+/// A full accept loop against hyper 1.x looks like this: clone the service
 /// per connection and drive it with `serve_connection`:
 ///
 /// ```no_run

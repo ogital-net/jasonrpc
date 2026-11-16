@@ -7,7 +7,7 @@
 //! back as a text message. Ping/pong and close frames are handled by the
 //! underlying library.
 //!
-//! This suits any bidirectional JSON-RPC-over-WebSocket workload — a browser
+//! This suits any bidirectional JSON-RPC-over-WebSocket workload: a browser
 //! subscribing to a live stats feed, an agent reporting telemetry, or a
 //! device-management protocol such as OpenWiFi's uCentral (where a device
 //! opens a WebSocket to a controller and the two exchange JSON-RPC messages).
@@ -18,7 +18,7 @@
 //!
 //! WebSocket is a protocol, not a byte framing, so this lives here rather than
 //! as a [`Framing`](crate::transport::Framing) codec: the library already
-//! yields whole messages, leaving only JSON-RPC dispatch — which the
+//! yields whole messages, leaving only JSON-RPC dispatch, which the
 //! transport-agnostic [`Router`] already does.
 //!
 //! Built on [`fastwebsockets`]. The [`upgrade`] re-export performs the
@@ -236,9 +236,9 @@ where
 /// Like [`serve`], but builds a fresh [`RequestContext`] for each message via
 /// `make_ctx`.
 ///
-/// Use this to pass transport-level metadata — for example an authenticated
+/// Use this to pass transport-level metadata (for example an authenticated
 /// session or client identity derived from the TLS certificate, or headers
-/// captured during the upgrade — to handlers registered with
+/// captured during the upgrade) to handlers registered with
 /// [`register_with_context`](Router::register_with_context). `make_ctx` is
 /// called once per inbound message.
 ///
@@ -322,7 +322,7 @@ where
 /// are allowed to finish first, so no reply is truncated mid-flight.
 ///
 /// `shutdown` is any `Future`, so it composes with whatever signal the
-/// application already uses — a [`tokio::sync::oneshot`] receiver, a
+/// application already uses: a [`tokio::sync::oneshot`] receiver, a
 /// `broadcast` receiver, `tokio_util`'s `CancellationToken::cancelled`, or a
 /// timer. No extra dependency is required.
 ///
@@ -334,8 +334,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns a [`WsError`] if the WebSocket connection fails. A clean close —
-/// whether initiated by the peer or by `shutdown` — returns `Ok(())`.
+/// Returns a [`WsError`] if the WebSocket connection fails. A clean close,
+/// whether initiated by the peer or by `shutdown`, returns `Ok(())`.
 ///
 /// ```no_run
 /// use jasonrpc::integration::websocket::{self, upgrade};
@@ -387,8 +387,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns a [`WsError`] if the WebSocket connection fails. A clean close —
-/// whether initiated by the peer or by `shutdown` — returns `Ok(())`.
+/// Returns a [`WsError`] if the WebSocket connection fails. A clean close,
+/// whether initiated by the peer or by `shutdown`, returns `Ok(())`.
 pub async fn serve_with_context_shutdown<S, State, F, Fut>(
     socket: WebSocket<S>,
     router: &Router<State>,

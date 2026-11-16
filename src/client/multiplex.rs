@@ -113,7 +113,7 @@ impl Drop for ReaderStateGuard {
 
 /// RAII guard that removes a call's id from the pending map when dropped.
 ///
-/// A `round_trip` future can be dropped before its reply arrives — most
+/// A `round_trip` future can be dropped before its reply arrives, most
 /// commonly when a caller-side timeout (`Client::with_request_timeout`) or
 /// cancellation fires while awaiting the oneshot. Cleanup prevents abandoned
 /// calls from accumulating in the map. Once the reader has delivered a reply,
